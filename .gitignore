@@ -1,0 +1,10 @@
+docs/superpowers
+.env
+# build + runtime
+mitia-ops
+mitia-ops.exe
+data/
+deployments/
+*.db
+*.db-wal
+*.db-shm
