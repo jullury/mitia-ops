@@ -30,7 +30,8 @@ stop / restart services via Docker.
 - **minio** — S3 object storage (+ console)
 - **caddy** — reverse proxy + TLS
 - **cloudflared** — Cloudflare Tunnel
-- **mailcow** — mail server (requires its own checkout; integration is a follow-up)
+- **mailcow** — mail server (read-only entry: exposes its config URL and a
+  status probe; the wrapper owns the `<data>/mailcow/` checkout and lifecycle)
 
 ## Layout
 
