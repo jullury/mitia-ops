@@ -4,11 +4,16 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 
 	"github.com/jullury/mitia-ops/internal/services"
 )
+
+// safeValueRe matches values Docker Compose's dotenv parser reads verbatim
+// without quoting: letters, digits, and common URL/path punctuation.
+var safeValueRe = regexp.MustCompile(`^[A-Za-z0-9_./@:\-]+$`)
 
 func DotEnv(values map[string]string) string {
 	keys := make([]string, 0, len(values))
@@ -18,9 +23,35 @@ func DotEnv(values map[string]string) string {
 	sort.Strings(keys)
 	var b strings.Builder
 	for _, k := range keys {
-		fmt.Fprintf(&b, "%s=%s\n", k, values[k])
+		if line, ok := dotEnvLine(k, values[k]); ok {
+			b.WriteString(line)
+		}
 	}
 	return b.String()
+}
+
+// dotEnvLine renders one KEY=VALUE line. Values containing a newline or a
+// carriage return cannot be represented in a dotenv file, so they are refused
+// (ok == false) rather than emitted malformed. Anything not matching
+// safeValueRe is wrapped in double quotes with \, ", ` and $ escaped.
+func dotEnvLine(k, v string) (string, bool) {
+	if strings.ContainsAny(v, "\r\n") {
+		return "", false
+	}
+	if safeValueRe.MatchString(v) {
+		return k + "=" + v + "\n", true
+	}
+	var q strings.Builder
+	q.WriteString(k + `="`)
+	for _, ch := range v {
+		switch ch {
+		case '\\', '"', '`', '$':
+			q.WriteByte('\\')
+		}
+		q.WriteRune(ch)
+	}
+	q.WriteString("\"\n")
+	return q.String(), true
 }
 
 func BuildRenderResult(k services.Kind, values map[string]string) (services.RenderResult, error) {

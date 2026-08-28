@@ -21,6 +21,41 @@ func TestDotEnvSorted(t *testing.T) {
 	}
 }
 
+func TestDotEnvQuotesUnsafeValues(t *testing.T) {
+	got := DotEnv(map[string]string{
+		"SECRET": `pa$$ "x" #hash \tick`,
+		"NAME":   "plain_value",
+	})
+	if !strings.Contains(got, "NAME=plain_value\n") {
+		t.Fatalf("safe value must stay unquoted: %q", got)
+	}
+	// unsafe value must be double-quoted with \, ", ` and $ escaped
+	want := "SECRET=\"pa\\$\\$ \\\"x\\\" #hash \\\\tick\"\n"
+	if !strings.Contains(got, want) {
+		t.Fatalf("unsafe value must be quoted and escaped:\ngot:  %q\nwant: %q", got, want)
+	}
+	if strings.Contains(got, "SECRET=pa$$") {
+		t.Fatalf("secret must not be emitted raw: %q", got)
+	}
+}
+
+func TestDotEnvRefusesNewlineValues(t *testing.T) {
+	got := DotEnv(map[string]string{
+		"A": "line1\nline2",
+		"B": "a\rb",
+		"C": "ok",
+	})
+	if strings.Contains(got, "\nline2") || strings.Contains(got, "\r") {
+		t.Fatalf("newline/carriage-return value must be omitted, not emitted raw: %q", got)
+	}
+	if strings.Contains(got, "A=") || strings.Contains(got, "B=") {
+		t.Fatalf("keys with multiline values must be omitted entirely: %q", got)
+	}
+	if !strings.Contains(got, "C=ok\n") {
+		t.Fatalf("valid values must still be emitted: %q", got)
+	}
+}
+
 func TestWriteComposeWritesOnlyCompose(t *testing.T) {
 	dir := t.TempDir()
 	res := services.RenderResult{
