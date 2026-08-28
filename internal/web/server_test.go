@@ -56,6 +56,57 @@ func TestDashboard(t *testing.T) {
 	}
 }
 
+func TestStatusClass(t *testing.T) {
+	cases := []struct{ in, class, title string }{
+		{`{"State":"running","Status":"Up 2 hours"}`, "running", "Running"},
+		{`{"State":"running","Status":"Up About a minute"}`, "running", "Running"},
+		{`{"State":"restarting"}`, "warning", "Warning"},
+		{`{"State":"paused"}`, "warning", "Warning"},
+		{`{"State":"exited"}`, "stopped", "Stopped"},
+		{`{"State":"dead"}`, "stopped", "Stopped"},
+		{`{"State":"stopped"}`, "stopped", "Stopped"},
+		{`{"State":"created"}`, "stopped", "Stopped"},
+		{``, "unknown", "Unknown"},
+		{`{"foo":"bar"}`, "unknown", "Unknown"},
+		// stderr warnings prepended to the JSON (the real bug): status must
+		// still resolve from the embedded "State" field.
+		{`time="2026-08-28T22:24:34+03:00" level=warning msg="The \"MINIO_ROOT_USER\" variable is not set. Defaulting to a blank string."` + "\n" + `{"State":"running","Status":"Up 4 minutes"}`, "running", "Running"},
+		{`warning line 1` + "\n" + `{"State":"exited","Status":"Exited (1)"}`, "stopped", "Stopped"},
+	}
+	for _, c := range cases {
+		if got := statusClass(c.in); got != c.class {
+			t.Errorf("statusClass(%q) = %q, want %q", c.in, got, c.class)
+		}
+		if got := statusTitle(c.in); got != c.title {
+			t.Errorf("statusTitle(%q) = %q, want %q", c.in, got, c.title)
+		}
+	}
+}
+
+func TestActionFlash(t *testing.T) {
+	d, h := testServer(t)
+	id, err := d.CreateService("minio", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest("POST", "/service/"+itoa(id)+"/action?op=up", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("status %d", rec.Code)
+	}
+	if loc := rec.Header().Get("Location"); loc != "/?msg=up" {
+		t.Fatalf("redirect location = %q, want /?msg=up", loc)
+	}
+	// follow the redirect and assert the flash banner renders
+	req2 := httptest.NewRequest("GET", "/?msg=up", nil)
+	rec2 := httptest.NewRecorder()
+	h.ServeHTTP(rec2, req2)
+	if !strings.Contains(rec2.Body.String(), "Service started") {
+		t.Fatalf("dashboard should show flash: %s", rec2.Body.String())
+	}
+}
+
 func TestUnknownActionOpRejected(t *testing.T) {
 	d, h := testServer(t)
 	id, err := d.CreateService("minio", "main")

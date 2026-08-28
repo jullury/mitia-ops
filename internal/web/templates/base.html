@@ -1,23 +1,140 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>mitia-ops</title>
 <style>
-  body { font-family: system-ui, sans-serif; margin: 2rem; color: #222; }
-  table { border-collapse: collapse; width: 100%; max-width: 900px; }
-  th, td { text-align: left; padding: .5rem .75rem; border-bottom: 1px solid #ddd; }
-  input[type=text], input[type=password] { padding: .4rem; width: 100%; max-width: 24rem; }
-  label { display: block; margin: .75rem 0 .25rem; font-weight: 600; }
-  .hint { color: #666; font-size: .85rem; font-weight: 400; }
-  .btn { display: inline-block; padding: .4rem .8rem; margin: .2rem;
-         border: 1px solid #999; border-radius: 4px; background: #fff;
-         color: #222; text-decoration: none; cursor: pointer; font-size: .9rem; }
-  .btn.primary { background: #1a73e8; color: #fff; border-color: #1a73e8; }
+  :root {
+    --bg: #020617;
+    --panel: #0F172A;
+    --panel-2: #1E293B;
+    --border: #334155;
+    --text: #F8FAFC;
+    --muted: #94A3B8;
+    --primary: #22C55E;
+    --primary-dim: #16A34A;
+    --warn: #F59E0B;
+    --danger: #EF4444;
+    --ok: #4ADE80;
+    --mono: "SFMono-Regular", ui-monospace, "Cascadia Code", "JetBrains Mono", Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "Fira Sans", Roboto, system-ui, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    font-family: var(--sans);
+    font-size: 16px;
+    line-height: 1.5;
+    color: var(--text);
+    background: var(--bg);
+  }
+  .wrap { max-width: 960px; margin: 0 auto; padding: 1.5rem 1rem 4rem; }
+  h1 { font-size: 1.5rem; margin: 0 0 1rem; font-weight: 700; }
+  h1 .sub { color: var(--muted); font-weight: 400; font-size: .95rem; }
+
+  /* Cards / surfaces */
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 1rem 1.25rem;
+    margin-bottom: 1.25rem;
+  }
+
+  a { color: var(--primary); }
+
+  /* Tables */
+  .table-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  table { border-collapse: collapse; width: 100%; min-width: 560px; }
+  th, td { text-align: left; padding: .75rem .85rem; border-bottom: 1px solid var(--border); }
+  th { text-transform: uppercase; font-size: .72rem; letter-spacing: .06em; color: var(--muted); }
+  tr:last-child td { border-bottom: none; }
+  .mono { font-family: var(--mono); font-size: .85rem; }
+
+  /* Status badges */
+  .badge {
+    display: inline-flex; align-items: center; gap: .4rem;
+    padding: .2rem .55rem; border-radius: 999px;
+    font-size: .72rem; font-weight: 600; letter-spacing: .03em;
+    border: 1px solid var(--border); color: var(--muted);
+    white-space: nowrap;
+  }
+  .badge .dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
+  .badge.running { color: var(--ok); border-color: rgba(74,222,128,.4); background: rgba(74,222,128,.08); }
+  .badge.running .dot { background: var(--ok); box-shadow: 0 0 6px var(--ok); }
+  .badge.stopped { color: var(--muted); }
+  .badge.warning { color: var(--warn); border-color: rgba(245,158,11,.4); background: rgba(245,158,11,.08); }
+  .badge.warning .dot { background: var(--warn); }
+  .badge.unknown { color: var(--muted); }
+  .badge-title { font-weight: 700; }
+
+  /* Forms */
+  label { display: block; margin: 1rem 0 .35rem; font-weight: 600; }
+  .hint { color: var(--muted); font-size: .82rem; font-weight: 400; }
+  input[type=text], input[type=password], select {
+    font-family: inherit; font-size: 1rem; color: var(--text);
+    background: var(--panel-2); border: 1px solid var(--border);
+    border-radius: 6px; padding: .6rem .65rem;
+    width: 100%; max-width: 26rem;
+  }
+  input[type=text]:hover, input[type=password]:hover, select:hover { border-color: var(--muted); }
+  input[type=checkbox] { width: 1.25rem; height: 1.25rem; accent-color: var(--primary); }
+
+  /* Buttons — 44px touch targets, distinct tones */
+  .btn {
+    display: inline-flex; align-items: center; justify-content: center;
+    min-height: 44px; min-width: 44px;
+    padding: .5rem 1rem;
+    border: 1px solid var(--border); border-radius: 6px;
+    background: transparent; color: var(--text);
+    font-family: inherit; font-size: .9rem; font-weight: 600;
+    text-decoration: none; cursor: pointer;
+    transition: background-color 160ms ease, border-color 160ms ease, color 160ms ease, transform 80ms ease;
+  }
+  .btn:hover { background: var(--panel-2); }
+  .btn:active { transform: translateY(1px); }
+  .btn.primary { background: var(--primary-dim); border-color: var(--primary-dim); color: #020617; }
+  .btn.primary:hover { background: var(--primary); }
+  .btn.danger { border-color: var(--danger); color: var(--danger); }
+  .btn.danger:hover { background: rgba(239,68,68,.12); }
+  .btn.muted { color: var(--muted); }
+  .actions { display: flex; flex-wrap: wrap; gap: .4rem; }
+  .actions form { margin: 0; }
+  .icon-btn { width: 44px; padding: 0; }
+  .icon-btn svg { display: block; }
+
+  /* Flash message */
+  .flash {
+    display: flex; align-items: center; gap: .5rem;
+    padding: .7rem 1rem; border-radius: 8px; margin-bottom: 1rem;
+    border: 1px solid rgba(74,222,128,.4); background: rgba(74,222,128,.1);
+    color: var(--ok); font-size: .9rem;
+  }
+
+  /* Focus visibility for keyboard nav */
+  :focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+
+  /* Respect reduced motion */
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      animation-duration: .01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: .01ms !important;
+    }
+    .btn:active { transform: none; }
+  }
+
+  @media (max-width: 640px) {
+    .wrap { padding: 1rem .85rem 3rem; }
+    h1 { font-size: 1.3rem; }
+  }
 </style>
 </head>
 <body>
+<div class="wrap">
 {{ template "content" . }}
+</div>
 </body>
 </html>

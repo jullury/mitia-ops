@@ -4,6 +4,7 @@ import (
 	"embed"
 	"html/template"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -29,8 +30,12 @@ func New(cfg Config) *http.ServeMux {
 	// and each page defines that content block. Because every page uses the
 	// same "content" name, parse base together with exactly one page per set
 	// so the block resolves without cross-page collision.
-	dashTmpl := template.Must(template.New("base.html").ParseFS(tmplFS, "templates/base.html", "templates/dashboard.html"))
-	svcTmpl := template.Must(template.New("base.html").ParseFS(tmplFS, "templates/base.html", "templates/service.html"))
+	funcs := template.FuncMap{
+		"statusClass": statusClass,
+		"statusTitle": statusTitle,
+	}
+	dashTmpl := template.Must(template.New("base.html").Funcs(funcs).ParseFS(tmplFS, "templates/base.html", "templates/dashboard.html"))
+	svcTmpl := template.Must(template.New("base.html").Funcs(funcs).ParseFS(tmplFS, "templates/base.html", "templates/service.html"))
 	s := &server{cfg: cfg, dashTmpl: dashTmpl, svcTmpl: svcTmpl}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", s.dashboard)
@@ -50,11 +55,84 @@ type server struct {
 type dashData struct {
 	Kinds    []services.Definition
 	Services []dashRow
+	Msg      string
+}
+
+var actionMsg = map[string]string{
+	"up":      "Service started",
+	"down":    "Service stopped",
+	"restart": "Service restarted",
 }
 
 type dashRow struct {
 	db.Service
-	Status string
+	Status string // raw first line from docker compose ps
+}
+
+var stateRe = regexp.MustCompile(`"State":\s*"([a-zA-Z]+)"`)
+
+// statusClass inspects the raw `docker compose ps --format json` output. That
+// output may have stderr warnings (e.g. "variable is not set") prepended, so
+// we scan the whole string for the JSON "State" field rather than trusting a
+// single line. For multi-container services we report the worst state present.
+func statusClass(raw string) string {
+	var states []string
+	for _, m := range stateRe.FindAllStringSubmatch(raw, -1) {
+		states = append(states, strings.ToLower(m[1]))
+	}
+	if len(states) == 0 {
+		return fallbackStatusClass(raw)
+	}
+	has := func(s string) bool {
+		for _, st := range states {
+			if st == s {
+				return true
+			}
+		}
+		return false
+	}
+	switch {
+	case has("restarting"), has("paused"):
+		return "warning"
+	case has("running"):
+		return "running"
+	case has("exited"), has("created"), has("stopped"), has("dead"):
+		return "stopped"
+	default:
+		return "unknown"
+	}
+}
+
+// fallbackStatusClass handles non-JSON output (e.g. an error or a version of
+// docker without the json format) via simple keyword heuristics.
+func fallbackStatusClass(raw string) string {
+	lower := strings.ToLower(raw)
+	switch {
+	case strings.Contains(lower, "running"), strings.Contains(lower, " up "):
+		return "running"
+	case strings.Contains(lower, "restarting"), strings.Contains(lower, "paused"):
+		return "warning"
+	case strings.Contains(lower, "exited"),
+		strings.Contains(lower, "dead"),
+		strings.Contains(lower, "stopped"),
+		strings.Contains(lower, "created"):
+		return "stopped"
+	default:
+		return "unknown"
+	}
+}
+
+func statusTitle(raw string) string {
+	switch statusClass(raw) {
+	case "running":
+		return "Running"
+	case "warning":
+		return "Warning"
+	case "stopped":
+		return "Stopped"
+	default:
+		return "Unknown"
+	}
 }
 
 func (s *server) dashboard(w http.ResponseWriter, r *http.Request) {
@@ -66,9 +144,10 @@ func (s *server) dashboard(w http.ResponseWriter, r *http.Request) {
 	rows := make([]dashRow, 0, len(svcs))
 	for _, svc := range svcs {
 		status, _ := docker.Status(s.deployDir(svc.ID), s.cfg.Docker)
-		rows = append(rows, dashRow{Service: svc, Status: firstLine(status)})
+		rows = append(rows, dashRow{Service: svc, Status: status})
 	}
-	s.dashTmpl.ExecuteTemplate(w, "base.html", dashData{Kinds: services.All(), Services: rows})
+	msg := actionMsg[r.URL.Query().Get("msg")]
+	s.dashTmpl.ExecuteTemplate(w, "base.html", dashData{Kinds: services.All(), Services: rows, Msg: msg})
 }
 
 func (s *server) newService(w http.ResponseWriter, r *http.Request) {
@@ -101,12 +180,20 @@ func (s *server) showService(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	items, _ := s.cfg.DB.ConfigItems(id)
-	values := decryptValues(s.cfg.Cipher, def, items)
-	s.svcTmpl.ExecuteTemplate(w, "base.html", struct {
-		Def     services.Definition
-		Service *db.Service
-		Values  map[string]string
-	}{def, svc, values})
+	values, secrets := decryptValues(s.cfg.Cipher, def, items, false)
+	s.svcTmpl.ExecuteTemplate(w, "base.html", svcData{
+		Def:       def,
+		Service:   svc,
+		Values:    values,
+		SecretSet: secrets,
+	})
+}
+
+type svcData struct {
+	Def       services.Definition
+	Service   *db.Service
+	Values    map[string]string // non-secret values for inputs (decrypted secrets excluded)
+	SecretSet map[string]bool   // field key -> true if a secret value is stored
 }
 
 func (s *server) saveService(w http.ResponseWriter, r *http.Request) {
@@ -211,7 +298,7 @@ func (s *server) serviceAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		items, _ := s.cfg.DB.ConfigItems(id)
-		values := decryptValues(s.cfg.Cipher, def, items)
+		values, _ := decryptValues(s.cfg.Cipher, def, items, true)
 		if _, err := render.WriteEnvFile(dir, values); err != nil {
 			http.Error(w, err.Error(), 500)
 			return
@@ -233,28 +320,37 @@ func (s *server) serviceAction(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	http.Redirect(w, r, "/", http.StatusSeeOther)
+	http.Redirect(w, r, "/?msg="+op, http.StatusSeeOther)
 }
 
 func (s *server) deployDir(id int64) string {
 	return s.cfg.DeployDir + "/" + strconv.FormatInt(id, 10)
 }
 
-func decryptValues(c *crypto.Cipher, def services.Definition, items map[string]string) map[string]string {
+// decryptValues returns a values map and, when includeSecrets is false, a
+// SecretSet map marking which secret fields already have a stored value.
+// Secrets are only included in the returned values when includeSecrets is
+// true (the launch-time path). For display, secrets are excluded from the
+// input values so stored secrets are never echoed back into the page.
+func decryptValues(c *crypto.Cipher, def services.Definition, items map[string]string, includeSecrets bool) (map[string]string, map[string]bool) {
 	out := map[string]string{}
+	secrets := map[string]bool{}
 	for _, f := range def.Fields {
 		raw := items[f.Key]
 		if f.Type == services.FieldSecret {
 			if raw != "" {
-				if dec, err := c.Decrypt(raw); err == nil {
-					out[f.Key] = dec
+				secrets[f.Key] = true
+				if includeSecrets {
+					if dec, err := c.Decrypt(raw); err == nil {
+						out[f.Key] = dec
+					}
 				}
 			}
 		} else {
 			out[f.Key] = raw
 		}
 	}
-	return out
+	return out, secrets
 }
 
 func idFromPath(w http.ResponseWriter, r *http.Request) int64 {
@@ -264,13 +360,6 @@ func idFromPath(w http.ResponseWriter, r *http.Request) int64 {
 		return 0
 	}
 	return id
-}
-
-func firstLine(s string) string {
-	if i := strings.IndexByte(s, '\n'); i >= 0 {
-		return s[:i]
-	}
-	return s
 }
 
 func itoa(id int64) string { return strconv.FormatInt(id, 10) }
