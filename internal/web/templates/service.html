@@ -1,0 +1,20 @@
+{{ define "content" }}
+<h1>{{ .Def.Label }}</h1>
+<p>Name: {{ .Service.Name }} &middot; Kind: {{ .Def.Kind }}</p>
+<form method="post" action="/service/{{ .Service.ID }}">
+  {{ range .Def.Fields }}
+  <label for="{{ .Key }}">{{ .Label }}
+    {{ if .Hints }}<span class="hint">({{ .Hints }})</span>{{ end }}
+  </label>
+  {{ if eq .Type 2 }} {{/* FieldBool */}}
+  <input type="checkbox" id="{{ .Key }}" name="{{ .Key }}" {{ if eq (index $.Values .Key) "true" }}checked{{ end }}>
+  {{ else }}
+  <input type="{{ if eq .Type 1 }}password{{ else }}text{{ end }}"
+         id="{{ .Key }}" name="{{ .Key }}"
+         placeholder="{{ .Placeholder }}" value="{{ index $.Values .Key }}">
+  {{ end }}
+  {{ end }}
+  <p><button class="btn primary" type="submit">Save</button></p>
+</form>
+<p><a href="/" class="btn">Back</a></p>
+{{ end }}

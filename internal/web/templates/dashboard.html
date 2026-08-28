@@ -1,0 +1,32 @@
+{{ define "content" }}
+<h1>mitia-ops — services</h1>
+<form method="post" action="/service/new">
+  <select name="kind">
+    {{ range .Kinds }}
+    <option value="{{ .Kind }}">{{ .Label }}</option>
+    {{ end }}
+  </select>
+  <button class="btn primary" type="submit">Add service</button>
+</form>
+<table>
+  <tr><th>Name</th><th>Kind</th><th>Status</th><th>Actions</th></tr>
+  {{ range .Services }}
+  <tr>
+    <td><a href="/service/{{ .ID }}">{{ .Name }}</a></td>
+    <td>{{ .Kind }}</td>
+    <td>{{ .Status }}</td>
+    <td>
+      <form method="post" action="/service/{{ .ID }}/action?op=up" style="display:inline">
+        <button class="btn">Up</button>
+      </form>
+      <form method="post" action="/service/{{ .ID }}/action?op=restart" style="display:inline">
+        <button class="btn">Restart</button>
+      </form>
+      <form method="post" action="/service/{{ .ID }}/action?op=down" style="display:inline">
+        <button class="btn">Down</button>
+      </form>
+    </td>
+  </tr>
+  {{ end }}
+</table>
+{{ end }}
