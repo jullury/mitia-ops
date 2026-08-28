@@ -35,6 +35,10 @@ type Definition struct {
 	Label  string
 	Fields []Field
 	Render func(values map[string]string) (RenderResult, error)
+	// ReadOnly kinds expose a config URL and read-only status; the app does
+	// not author config, write .env/compose, or control lifecycle for them.
+	ReadOnly  bool
+	ConfigURL func(values map[string]string) string
 }
 
 func (d Definition) Defaults() map[string]string {

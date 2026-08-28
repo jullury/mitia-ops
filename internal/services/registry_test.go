@@ -43,3 +43,18 @@ func TestSecretFieldMarked(t *testing.T) {
 		t.Fatal("MINIO_ROOT_PASSWORD should be a secret field")
 	}
 }
+
+func TestRegistryReadOnlyAndConfigURL(t *testing.T) {
+	defs := All()
+	for _, d := range defs {
+		if !d.ReadOnly {
+			if d.ConfigURL != nil {
+				t.Fatalf("config url set on non-read-only kind %s; only read-only kinds expose a config url", d.Kind)
+			}
+			continue
+		}
+		if d.ConfigURL == nil {
+			t.Fatalf("read-only kind %s must provide a ConfigURL func", d.Kind)
+		}
+	}
+}
