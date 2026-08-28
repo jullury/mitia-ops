@@ -44,14 +44,31 @@ func TestServiceCRUD(t *testing.T) {
 	}
 }
 
-func TestCascadeDelete(t *testing.T) {
+func TestDeleteServiceCascades(t *testing.T) {
 	d, _ := Open(filepath.Join(t.TempDir(), "test.db"))
 	defer d.Close()
 	id, _ := d.CreateService("minio", "x")
 	_ = d.SetConfigItems(id, []ConfigItem{{Key: "K", Value: "V"}})
-	// no explicit delete API in v1; verify FK pragma is on
+	// verify FK pragma is on so the cascade below actually runs
 	if !d.ForeignKeysEnabled() {
 		t.Fatal("expected foreign keys enabled")
+	}
+	// existing external integrity: deleting a missing service is idempotent
+	if err := d.DeleteService(id); err != nil {
+		t.Fatalf("delete service: %v", err)
+	}
+	// row gone; config items cascaded away
+	items, _ := d.ConfigItems(id)
+	if len(items) != 0 {
+		t.Fatalf("config items should cascade-delete with service, got %+v", items)
+	}
+	list, _ := d.ListServices()
+	if len(list) != 0 {
+		t.Fatalf("service list should be empty after delete, got %+v", list)
+	}
+	// a second delete is a harmless no-op
+	if err := d.DeleteService(id); err != nil {
+		t.Fatalf("second delete should be a no-op, got %v", err)
 	}
 }
 

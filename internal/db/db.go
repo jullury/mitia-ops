@@ -86,6 +86,23 @@ func (d *DB) ServiceByID(id int64) (*Service, error) {
 	return &s, nil
 }
 
+// DeleteService removes a service and (via the ON DELETE CASCADE foreign key)
+// its config items, in a single transaction so no orphaned rows remain.
+func (d *DB) DeleteService(id int64) error {
+	tx, err := d.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec("DELETE FROM services WHERE id = ?", id); err != nil {
+		return err
+	}
+	if _, err := tx.Exec("DELETE FROM config_items WHERE service_id = ?", id); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 func (d *DB) SetConfigItems(serviceID int64, items []ConfigItem) error {
 	tx, err := d.db.Begin()
 	if err != nil {

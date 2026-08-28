@@ -9,6 +9,10 @@
     <a class="btn" href="{{ .ConfigURL }}" target="_blank" rel="noopener">Open config</a>
     {{ end }}
     <a href="/" class="btn muted">← Services</a>
+    <form method="post" action="/service/{{ .Service.ID }}/delete"
+          onsubmit="return confirm('Delete {{ .Service.Name }}? This removes the deploy directory and its data volume. This cannot be undone.')">
+      <button class="btn danger" type="submit">Delete service</button>
+    </form>
   </div>
 </div>
 

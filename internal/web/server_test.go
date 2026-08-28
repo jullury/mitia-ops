@@ -916,3 +916,149 @@ func TestSaveRejectsOversizedVolume(t *testing.T) {
 		t.Fatalf("rejected size must not be persisted, stored %q", items["MINIO_VOLUME_SIZE"])
 	}
 }
+
+func TestDeleteServiceTearsDownAndRemovesRows(t *testing.T) {
+	d, h := testServer(t)
+	id, err := d.CreateService("cloudflared", "tun")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// seed config so we can assert cascade removal of config items
+	if err := d.SetConfigItems(id, []db.ConfigItem{{Key: "CF_TUNNEL", Value: "x"}}); err != nil {
+		t.Fatal(err)
+	}
+
+	// testServer uses its own ephemeral deploy dir; build a fresh handler with a
+	// known deploy dir + runner so we can assert `down` ran and the dir removal.
+	runner := &fakeRunner{}
+	dep := t.TempDir()
+	c, _ := crypto.New("master")
+	h = New(Config{DB: d, Cipher: c, DeployDir: dep, Docker: runner})
+	deployDir := filepath.Join(dep, itoa(id))
+	if err := os.MkdirAll(deployDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest("POST", "/service/"+itoa(id)+"/delete", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("delete status %d", rec.Code)
+	}
+	if loc := rec.Header().Get("Location"); loc != "/?msg=deleted" {
+		t.Fatalf("redirect location = %q, want /?msg=deleted", loc)
+	}
+	// compose down ran
+	if got := strings.Join(runner.recorded(), ","); !strings.Contains(got, "down") {
+		t.Fatalf("delete must run compose down, got %v", runner.recorded())
+	}
+	// DB row + config items gone
+	if _, err := d.ServiceByID(id); err == nil {
+		t.Fatal("service row should be deleted")
+	}
+	items, _ := d.ConfigItems(id)
+	if len(items) != 0 {
+		t.Fatalf("config items should cascade-delete, got %+v", items)
+	}
+	// deploy dir removed
+	if _, err := os.Stat(deployDir); !os.IsNotExist(err) {
+		t.Fatalf("deploy dir should be removed after delete (got %v)", err)
+	}
+}
+
+func TestDeleteMinioRemovesDataVolume(t *testing.T) {
+	d, err := db.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { d.Close() })
+	c, _ := crypto.New("master")
+	deployDir := t.TempDir()
+	raw := &fakeRawRunner{}
+	h := New(Config{DB: d, Cipher: c, DeployDir: deployDir, Docker: &fakeRunner{}, DockerRaw: raw})
+
+	id, _ := d.CreateService("minio", "main")
+	// persist a custom volume name to assert we remove exactly that one
+	if err := d.SetConfigItems(id, []db.ConfigItem{{Key: "MINIO_VOLUME_NAME", Value: "custom_data"}}); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest("POST", "/service/"+itoa(id)+"/delete", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("delete status %d: %s", rec.Code, rec.Body.String())
+	}
+	// assert the data volume was removed by the raw runner
+	joined := strings.Join(raw.ran, " ")
+	if !strings.Contains(joined, "volume rm") || !strings.Contains(joined, "custom_data") {
+		t.Fatalf("delete must remove the minio data volume, raw runner ran: %v", raw.ran)
+	}
+	// DB row gone
+	if _, err := d.ServiceByID(id); err == nil {
+		t.Fatal("service row should be deleted")
+	}
+}
+
+func TestDeleteReadOnlyServiceSkipsDownButDeletes(t *testing.T) {
+	d, err := db.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { d.Close() })
+	c, _ := crypto.New("master")
+	runner := &fakeRunner{}
+	h := New(Config{DB: d, Cipher: c, DeployDir: t.TempDir(), MailcowDir: t.TempDir(), Docker: runner})
+	id, err := d.CreateService("mailcow", "mail")
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest("POST", "/service/"+itoa(id)+"/delete", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("delete status %d", rec.Code)
+	}
+	// mailcow is externally-managed: never run compose down against our deploy dir
+	if got := runner.recorded(); len(got) != 0 {
+		t.Fatalf("deleting a read-only service must not run compose, got %v", got)
+	}
+	if _, err := d.ServiceByID(id); err == nil {
+		t.Fatal("service row should be deleted")
+	}
+}
+
+func TestDashboardAndServicePageRenderDelete(t *testing.T) {
+	d, h := testServer(t)
+	id, err := d.CreateService("minio", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dash := httptest.NewRequest("GET", "/", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, dash)
+	if !strings.Contains(rec.Body.String(), "/service/"+itoa(id)+"/delete") {
+		t.Fatalf("dashboard should render the delete form: %s", rec.Body.String())
+	}
+	page := httptest.NewRequest("GET", "/service/"+itoa(id), nil)
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, page)
+	body := rec.Body.String()
+	if !strings.Contains(body, "/service/"+itoa(id)+"/delete") {
+		t.Fatalf("service page should render the delete form: %s", body)
+	}
+	if !strings.Contains(body, "Delete service") {
+		t.Fatalf("service page should have a Delete service button: %s", body)
+	}
+}
+
+func TestDeleteUnknownServiceNotFound(t *testing.T) {
+	_, h := testServer(t)
+	req := httptest.NewRequest("POST", "/service/999999/delete", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("deleting a missing service should be 404, got %d", rec.Code)
+	}
+}

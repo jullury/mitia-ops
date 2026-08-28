@@ -71,6 +71,7 @@ func New(cfg Config) *http.ServeMux {
 	mux.HandleFunc("GET /service/{id}", s.showService)
 	mux.HandleFunc("POST /service/{id}", s.saveService)
 	mux.HandleFunc("POST /service/{id}/action", s.serviceAction)
+	mux.HandleFunc("POST /service/{id}/delete", s.deleteService)
 	return mux
 }
 
@@ -122,9 +123,11 @@ func sizeNum(v string) string { n, _ := services.SplitSize(v); return n }
 func sizeSuffix(v string) string { _, s := services.SplitSize(v); return s }
 
 var actionMsg = map[string]string{
-	"up":      "Service started",
-	"down":    "Service stopped",
-	"restart": "Service restarted",
+	"up":          "Service started",
+	"down":        "Service stopped",
+	"restart":     "Service restarted",
+	"deleted":     "Service deleted",
+	"deleted_err": "Service deleted, but containers could not be brought down — they may still be running",
 }
 
 var serviceMsg = map[string]string{
@@ -587,6 +590,71 @@ func (s *server) serviceAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.Redirect(w, r, "/?msg="+op, http.StatusSeeOther)
+}
+
+// deleteService removes a service: it tears down any running containers,
+// removes the resizeable data volume (if any) along with its data, deletes the
+// deploy directory, and finally removes the DB row (config items cascade).
+func (s *server) deleteService(w http.ResponseWriter, r *http.Request) {
+	id := idFromPath(w, r)
+	if id == 0 {
+		return
+	}
+	svc, err := s.cfg.DB.ServiceByID(id)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	dir := s.deployDir(id)
+
+	// Tear down running containers. This is best-effort: a service that was
+	// never started (no compose file / deploy dir yet) has nothing to bring
+	// down, and that must not block deletion. Read-only kinds rely on an
+	// externally-managed checkout and never get a compose here, so skip them.
+	downErr := error(nil)
+	if def, ok := services.Get(services.Kind(svc.Kind)); ok && !def.ReadOnly {
+		_, downErr = docker.Down(dir, s.cfg.Docker)
+	}
+
+	// Remove the service-owned resizeable data volume (and its data). Blinding
+	// deletion of a minio volume would leak the data; removing it is the change
+	// the user opted into.
+	if s.cfg.DockerRaw != nil {
+		if namedVolume, ok := resizeVolumeNames[services.Kind(svc.Kind)]; ok {
+			name := ""
+			if items, err := s.cfg.DB.ConfigItems(id); err == nil {
+				name = items["MINIO_VOLUME_NAME"]
+			}
+			if name == "" {
+				name = docker.VolumeName(dir, namedVolume)
+			}
+			if exists, _ := docker.VolumeExists(s.cfg.DockerRaw, name); exists {
+				if err := docker.RemoveVolume(s.cfg.DockerRaw, name); err != nil {
+					http.Error(w, err.Error(), 500)
+					return
+				}
+			}
+		}
+	}
+
+	// Drop the deploy directory (compose file, ephemeral creds/config).
+	if err := os.RemoveAll(dir); err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+
+	if err := s.cfg.DB.DeleteService(id); err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	// Surface a down failure (if any) as a flash notice rather than aborting the
+	// delete: the row, volume and deploy dir are already gone, and a failed down
+	// only means containers may still be running orphaned.
+	if downErr != nil {
+		http.Redirect(w, r, "/?msg=deleted_err", http.StatusSeeOther)
+		return
+	}
+	http.Redirect(w, r, "/?msg=deleted", http.StatusSeeOther)
 }
 
 // resizeVolumeNames maps a service kind to the named volume (volume name in the
