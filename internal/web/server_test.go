@@ -25,10 +25,11 @@ func testServer(t *testing.T) (*db.DB, http.Handler) {
 	t.Cleanup(func() { d.Close() })
 	c, _ := crypto.New("master")
 	cfg := Config{
-		DB:        d,
-		Cipher:    c,
-		DeployDir: t.TempDir(),
-		Docker:    fakeRunner{},
+		DB:         d,
+		Cipher:     c,
+		DeployDir:  t.TempDir(),
+		MailcowDir: t.TempDir(),
+		Docker:     fakeRunner{},
 	}
 	return d, New(cfg)
 }
@@ -124,5 +125,21 @@ func TestUpActionRemovesEphemeralEnv(t *testing.T) {
 	}
 	if _, err := os.Stat(envPath); !os.IsNotExist(err) {
 		t.Fatalf("ephemeral .env must be removed after up, still exists: %v", err)
+	}
+}
+
+func TestMailcowLifecycleRejected(t *testing.T) {
+	d, h := testServer(t)
+	id, err := d.CreateService("mailcow", "mail")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, op := range []string{"up", "down", "restart"} {
+		req := httptest.NewRequest("POST", "/service/"+itoa(id)+"/action?op="+op, nil)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("mailcow %s must be rejected with 400, got %d", op, rec.Code)
+		}
 	}
 }

@@ -49,10 +49,11 @@ func main() {
 	}
 
 	mux := web.New(web.Config{
-		DB:        d,
-		Cipher:    cipher,
-		DeployDir: deployDir,
-		Docker:    docker.NewCLI(),
+		DB:         d,
+		Cipher:     cipher,
+		DeployDir:  deployDir,
+		MailcowDir: dataDir + "/mailcow",
+		Docker:     docker.NewCLI(),
 	})
 	log.Printf("mitia-ops listening on %s", addr)
 	log.Fatal(http.ListenAndServe(addr, mux))

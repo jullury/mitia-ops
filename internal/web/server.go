@@ -18,10 +18,11 @@ import (
 var tmplFS embed.FS
 
 type Config struct {
-	DB        *db.DB
-	Cipher    *crypto.Cipher
-	DeployDir string
-	Docker    docker.Runner
+	DB         *db.DB
+	Cipher     *crypto.Cipher
+	DeployDir  string
+	MailcowDir string // shared wrapper-owned mailcow checkout; used only for read-only status probe
+	Docker     docker.Runner
 }
 
 func New(cfg Config) *http.ServeMux {
@@ -65,7 +66,7 @@ func (s *server) dashboard(w http.ResponseWriter, r *http.Request) {
 	}
 	rows := make([]dashRow, 0, len(svcs))
 	for _, svc := range svcs {
-		status, _ := docker.Status(s.deployDir(svc.ID), s.cfg.Docker)
+		status, _ := docker.Status(s.statusDir(svc), s.cfg.Docker)
 		rows = append(rows, dashRow{Service: svc, Status: firstLine(status)})
 	}
 	s.dashTmpl.ExecuteTemplate(w, "base.html", dashData{Kinds: services.All(), Services: rows})
@@ -197,19 +198,26 @@ func (s *server) serviceAction(w http.ResponseWriter, r *http.Request) {
 	}
 	dir := s.deployDir(id)
 
+	// Read-only kinds (e.g. mailcow) have no lifecycle control: reject any
+	// up/down/restart before touching docker or any temporary .env.
+	svc, err := s.cfg.DB.ServiceByID(id)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	def, ok := services.Get(services.Kind(svc.Kind))
+	if !ok {
+		http.Error(w, "unknown kind", 500)
+		return
+	}
+	if def.ReadOnly {
+		http.Error(w, "read-only service has no lifecycle control", 400)
+		return
+	}
+
 	// For `up`, decrypt secrets from SQLite into a temporary .env for the
 	// duration of the composer command, then delete it (ephemeral .env).
 	if op == "up" {
-		svc, err := s.cfg.DB.ServiceByID(id)
-		if err != nil {
-			http.NotFound(w, r)
-			return
-		}
-		def, ok := services.Get(services.Kind(svc.Kind))
-		if !ok {
-			http.Error(w, "unknown kind", 500)
-			return
-		}
 		items, _ := s.cfg.DB.ConfigItems(id)
 		values := decryptValues(s.cfg.Cipher, def, items)
 		if _, err := render.WriteEnvFile(dir, values); err != nil {
@@ -220,7 +228,6 @@ func (s *server) serviceAction(w http.ResponseWriter, r *http.Request) {
 		defer render.RemoveEnvFile(dir)
 	}
 
-	var err error
 	switch op {
 	case "up":
 		_, err = docker.Up(dir, s.cfg.Docker)
@@ -238,6 +245,13 @@ func (s *server) serviceAction(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) deployDir(id int64) string {
 	return s.cfg.DeployDir + "/" + strconv.FormatInt(id, 10)
+}
+
+func (s *server) statusDir(svc db.Service) string {
+	if def, ok := services.Get(services.Kind(svc.Kind)); ok && def.ReadOnly {
+		return s.cfg.MailcowDir
+	}
+	return s.deployDir(svc.ID)
 }
 
 func decryptValues(c *crypto.Cipher, def services.Definition, items map[string]string) map[string]string {
