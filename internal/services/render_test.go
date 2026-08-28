@@ -11,7 +11,6 @@ func TestMinioRender(t *testing.T) {
 		"MINIO_HOSTNAME":      "s3.example.com",
 		"MINIO_ROOT_USER":     "admin",
 		"MINIO_ROOT_PASSWORD": "superSecret",
-		"MINIO_BROWSER":       "true",
 	})
 	if err != nil {
 		t.Fatal(err)
