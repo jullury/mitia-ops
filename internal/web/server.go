@@ -197,12 +197,17 @@ func (s *server) saveService(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	// WriteCompose persists only the non-secret docker-compose.yml.
-	// Secrets are never written to a .env here; they stay in SQLite (encrypted)
-	// and are decrypted into a temporary .env only at launch time.
-	if err := render.WriteCompose(s.deployDir(id), res); err != nil {
-		http.Error(w, err.Error(), 500)
-		return
+	// Save persists only the non-secret docker-compose.yml, and only for kinds
+	// that actually render a compose payload. Read-only kinds (and any kind
+	// with an empty render) write nothing, so no deployments/<id>/ dir is
+	// created for them. Secrets are never written to a .env here; they stay in
+	// SQLite (encrypted) and are decrypted into a temporary .env only at
+	// launch time.
+	if strings.TrimSpace(res.ComposeYAML) != "" {
+		if err := render.WriteCompose(s.deployDir(id), res); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
 	}
 	http.Redirect(w, r, "/service/"+strconv.FormatInt(id, 10), http.StatusSeeOther)
 }

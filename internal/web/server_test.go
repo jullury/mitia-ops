@@ -6,15 +6,32 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/jullury/mitia-ops/internal/crypto"
 	"github.com/jullury/mitia-ops/internal/db"
 )
 
-type fakeRunner struct{}
+type fakeRunner struct {
+	mu    sync.Mutex
+	calls []string
+}
 
-func (fakeRunner) Run(dir string, args ...string) (string, error) { return "ok", nil }
+func (f *fakeRunner) Run(dir string, args ...string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, strings.Join(append([]string{"compose"}, args...), " "))
+	return "ok", nil
+}
+
+func (f *fakeRunner) recorded() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]string, len(f.calls))
+	copy(out, f.calls)
+	return out
+}
 
 func testServer(t *testing.T) (*db.DB, http.Handler) {
 	t.Helper()
@@ -29,7 +46,7 @@ func testServer(t *testing.T) (*db.DB, http.Handler) {
 		Cipher:     c,
 		DeployDir:  t.TempDir(),
 		MailcowDir: t.TempDir(),
-		Docker:     fakeRunner{},
+		Docker:     &fakeRunner{},
 	}
 	return d, New(cfg)
 }
@@ -103,7 +120,7 @@ func TestUpActionRemovesEphemeralEnv(t *testing.T) {
 		req := httptest.NewRequest("POST", "/service/"+itoa(id), strings.NewReader(form))
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		rec := httptest.NewRecorder()
-		New(Config{DB: d, Cipher: c, DeployDir: deployDir, Docker: fakeRunner{}}).ServeHTTP(rec, req)
+		New(Config{DB: d, Cipher: c, DeployDir: deployDir, Docker: &fakeRunner{}}).ServeHTTP(rec, req)
 		if rec.Code != http.StatusSeeOther {
 			t.Fatalf("save status %d", rec.Code)
 		}
@@ -119,7 +136,7 @@ func TestUpActionRemovesEphemeralEnv(t *testing.T) {
 
 	req := httptest.NewRequest("POST", "/service/"+itoa(id)+"/action?op=up", nil)
 	rec := httptest.NewRecorder()
-	New(Config{DB: d, Cipher: c, DeployDir: deployDir, Docker: fakeRunner{}}).ServeHTTP(rec, req)
+	New(Config{DB: d, Cipher: c, DeployDir: deployDir, Docker: &fakeRunner{}}).ServeHTTP(rec, req)
 	if rec.Code != http.StatusSeeOther {
 		t.Fatalf("up status %d", rec.Code)
 	}
@@ -129,7 +146,17 @@ func TestUpActionRemovesEphemeralEnv(t *testing.T) {
 }
 
 func TestMailcowLifecycleRejected(t *testing.T) {
-	d, h := testServer(t)
+	dbDir := filepath.Join(t.TempDir(), "test.db")
+	d, err := db.Open(dbDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { d.Close() })
+	c, _ := crypto.New("master")
+	deployDir := t.TempDir()
+	runner := &fakeRunner{}
+	h := New(Config{DB: d, Cipher: c, DeployDir: deployDir, MailcowDir: t.TempDir(), Docker: runner})
+
 	id, err := d.CreateService("mailcow", "mail")
 	if err != nil {
 		t.Fatal(err)
@@ -141,6 +168,68 @@ func TestMailcowLifecycleRejected(t *testing.T) {
 		if rec.Code != http.StatusBadRequest {
 			t.Fatalf("mailcow %s must be rejected with 400, got %d", op, rec.Code)
 		}
+		if got := runner.recorded(); len(got) != 0 {
+			t.Fatalf("mailcow %s must be rejected before any docker command runs, got %v", op, got)
+		}
+		envPath := filepath.Join(deployDir, itoa(id), ".env")
+		if _, err := os.Stat(envPath); !os.IsNotExist(err) {
+			t.Fatalf("mailcow %s must be rejected before a temp .env is written (at %s)", op, envPath)
+		}
+	}
+}
+
+func TestSaveReadOnlyServiceDoesNotCreateDeployDir(t *testing.T) {
+	dbDir := filepath.Join(t.TempDir(), "test.db")
+	d, err := db.Open(dbDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { d.Close() })
+	c, _ := crypto.New("master")
+	deployDir := t.TempDir()
+	h := New(Config{DB: d, Cipher: c, DeployDir: deployDir, MailcowDir: t.TempDir(), Docker: &fakeRunner{}})
+
+	id, err := d.CreateService("mailcow", "mail")
+	if err != nil {
+		t.Fatal(err)
+	}
+	form := "MAILCOW_HTTP_PORT=8080"
+	req := httptest.NewRequest("POST", "/service/"+itoa(id), strings.NewReader(form))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("save status %d", rec.Code)
+	}
+	if _, err := os.Stat(filepath.Join(deployDir, itoa(id))); !os.IsNotExist(err) {
+		t.Fatalf("saving a read-only service must not create its deploy dir (got %v)", err)
+	}
+}
+
+func TestShowServiceMailcowConfigLink(t *testing.T) {
+	d, h := testServer(t)
+	id, err := d.CreateService("mailcow", "mail")
+	if err != nil {
+		t.Fatal(err)
+	}
+	form := "MAILCOW_HTTP_PORT=8080"
+	req := httptest.NewRequest("POST", "/service/"+itoa(id), strings.NewReader(form))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("save status %d", rec.Code)
+	}
+
+	req = httptest.NewRequest("GET", "/service/"+itoa(id), nil)
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("status %d", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `href="http://localhost:8080"`) {
+		t.Fatalf("service page should render the mailcow config url link: %s", body)
 	}
 }
 
