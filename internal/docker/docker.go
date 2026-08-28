@@ -19,14 +19,11 @@ func (c *CLI) Run(dir string, args ...string) (string, error) {
 	cmd := exec.Command("docker", full...)
 	cmd.Dir = dir
 	out, err := cmd.CombinedOutput()
+	msg := strings.TrimSpace(string(out))
 	if err != nil {
-		return strings.TrimSpace(string(out)), fmt.Errorf("docker compose: %w: %s", err, strings.TrimSpace(string(out)))
+		return msg, fmt.Errorf("docker compose: %w: %s", err, msg)
 	}
-	return strings.TrimSpace(string(out)), nil
-}
-
-func composeCmd(fn func(Runner, string, ...string) (string, error), dir string, r Runner, composeArgs ...string) (string, error) {
-	return fn(r, dir, composeArgs...)
+	return msg, nil
 }
 
 func Status(dir string, r Runner) (string, error) {
