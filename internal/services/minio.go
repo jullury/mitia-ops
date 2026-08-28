@@ -8,13 +8,14 @@ func init() {
 		Label: "Minio (S3 object storage)",
 		Fields: []Field{
 			{Key: "MINIO_HOSTNAME", Label: "Hostname", Type: FieldString, Placeholder: "s3.example.com"},
+			{Key: "MINIO_CONSOLE_URL", Label: "Console URL", Type: FieldString, Placeholder: "https://console.example.com"},
 			{Key: "MINIO_ROOT_USER", Label: "Root user", Type: FieldString, Placeholder: "minioadmin"},
 			{Key: "MINIO_ROOT_PASSWORD", Label: "Root password", Type: FieldSecret, Hints: ">= 8 chars"},
 			{
 				Key:   "MINIO_VOLUME_SIZE",
 				Label: "Volume size limit",
 				Type:  FieldSize,
-				Hints: "minio data volume upper bound",
+				Hints: "soft upper bound; used for the free-space preflight (Docker local volumes cannot enforce a size)",
 				Units: []SizeUnit{
 					{Label: "MiB", Suffix: "M", Base: 1 << 20},
 					{Label: "GiB", Suffix: "G", Base: 1 << 30},
@@ -30,7 +31,7 @@ func init() {
 
 func minioEnv(v map[string]string) string {
 	var b strings.Builder
-	for _, k := range []string{"MINIO_HOSTNAME", "MINIO_ROOT_USER", "MINIO_ROOT_PASSWORD", "MINIO_VOLUME_SIZE"} {
+	for _, k := range []string{"MINIO_HOSTNAME", "MINIO_CONSOLE_URL", "MINIO_ROOT_USER", "MINIO_ROOT_PASSWORD", "MINIO_VOLUME_SIZE"} {
 		if val, ok := v[k]; ok {
 			b.WriteString(k + "=" + val + "\n")
 		}
@@ -43,7 +44,8 @@ func minioCompose(v map[string]string) string {
 	if volName == "" {
 		volName = "minio_data"
 	}
-	return `services:
+	var b strings.Builder
+	b.WriteString(`services:
   minio:
     image: minio/minio:latest
     command: server /data --console-address ":9001"
@@ -54,10 +56,26 @@ func minioCompose(v map[string]string) string {
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
-    volumes:
+`)
+	if h, ok := v["MINIO_HOSTNAME"]; ok && h != "" {
+		b.WriteString("      MINIO_SERVER_URL: " + absoluteURL(h) + "\n")
+	}
+	if c, ok := v["MINIO_CONSOLE_URL"]; ok && c != "" {
+		b.WriteString("      MINIO_BROWSER_REDIRECT_URL: " + absoluteURL(c) + "\n")
+	}
+	b.WriteString(`    volumes:
       - minio_data:/data
 volumes:
   minio_data:
     external: true
-    name: ` + volName + "\n"
+    name: ` + volName + "\n")
+	return b.String()
+}
+
+// absoluteURL defaults a scheme-less host to https.
+func absoluteURL(host string) string {
+	if strings.Contains(host, "://") {
+		return host
+	}
+	return "https://" + host
 }

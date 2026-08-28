@@ -9,6 +9,7 @@ func TestMinioRender(t *testing.T) {
 	def, _ := Get(KindMinio)
 	res, err := def.Render(map[string]string{
 		"MINIO_HOSTNAME":      "s3.example.com",
+		"MINIO_CONSOLE_URL":   "https://console.example.com",
 		"MINIO_ROOT_USER":     "admin",
 		"MINIO_ROOT_PASSWORD": "superSecret",
 		"MINIO_VOLUME_SIZE":   "100G",
@@ -30,6 +31,29 @@ func TestMinioRender(t *testing.T) {
 	}
 	if !strings.Contains(res.ComposeYAML, "name: "+"minio_data") {
 		t.Fatalf("expected external volume name in compose: %q", res.ComposeYAML)
+	}
+	if !strings.Contains(res.ComposeYAML, "MINIO_SERVER_URL: https://s3.example.com") {
+		t.Fatalf("expected minio server url advertised from hostname: %q", res.ComposeYAML)
+	}
+	if !strings.Contains(res.ComposeYAML, "MINIO_BROWSER_REDIRECT_URL: https://console.example.com") {
+		t.Fatalf("expected minio console url redirected from console url: %q", res.ComposeYAML)
+	}
+}
+
+func TestMinioRenderNoHostname(t *testing.T) {
+	def, _ := Get(KindMinio)
+	res, err := def.Render(map[string]string{
+		"MINIO_ROOT_USER":     "admin",
+		"MINIO_ROOT_PASSWORD": "superSecret",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(res.ComposeYAML, "MINIO_SERVER_URL") {
+		t.Fatalf("no MINIO_SERVER_URL expected without a hostname: %q", res.ComposeYAML)
+	}
+	if strings.Contains(res.ComposeYAML, "MINIO_BROWSER_REDIRECT_URL") {
+		t.Fatalf("no MINIO_BROWSER_REDIRECT_URL expected without a console url: %q", res.ComposeYAML)
 	}
 }
 
