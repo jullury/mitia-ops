@@ -102,3 +102,16 @@ func TestWriteEnvFileAndRemove(t *testing.T) {
 		t.Fatal("expected .env to be removed")
 	}
 }
+
+func TestBuildRenderResultEmptyForReadOnlyMailcow(t *testing.T) {
+	res, err := BuildRenderResult(services.KindMailcow, map[string]string{"MAILCOW_HTTP_PORT": "8080"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.ComposeYAML != "" {
+		t.Fatalf("mailcow must not emit compose, got %q", res.ComposeYAML)
+	}
+	if res.DotEnv != "" {
+		t.Fatalf("mailcow must not emit a dotenv (no compose payload), got %q", res.DotEnv)
+	}
+}

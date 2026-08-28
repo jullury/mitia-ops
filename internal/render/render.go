@@ -63,7 +63,7 @@ func BuildRenderResult(k services.Kind, values map[string]string) (services.Rend
 	if err != nil {
 		return services.RenderResult{}, err
 	}
-	if res.DotEnv == "" {
+	if res.DotEnv == "" && strings.TrimSpace(res.ComposeYAML) != "" {
 		res.DotEnv = DotEnv(values)
 	}
 	return res, nil
