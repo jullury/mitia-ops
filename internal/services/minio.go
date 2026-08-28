@@ -10,6 +10,17 @@ func init() {
 			{Key: "MINIO_HOSTNAME", Label: "Hostname", Type: FieldString, Placeholder: "s3.example.com"},
 			{Key: "MINIO_ROOT_USER", Label: "Root user", Type: FieldString, Placeholder: "minioadmin"},
 			{Key: "MINIO_ROOT_PASSWORD", Label: "Root password", Type: FieldSecret, Hints: ">= 8 chars"},
+			{
+				Key:   "MINIO_VOLUME_SIZE",
+				Label: "Volume size limit",
+				Type:  FieldSize,
+				Hints: "minio data volume upper bound",
+				Units: []SizeUnit{
+					{Label: "MiB", Suffix: "M", Base: 1 << 20},
+					{Label: "GiB", Suffix: "G", Base: 1 << 30},
+					{Label: "TiB", Suffix: "T", Base: 1 << 40},
+				},
+			},
 		},
 		Render: func(values map[string]string) (RenderResult, error) {
 			return RenderResult{DotEnv: minioEnv(values), ComposeYAML: minioCompose(values)}, nil
@@ -19,7 +30,7 @@ func init() {
 
 func minioEnv(v map[string]string) string {
 	var b strings.Builder
-	for _, k := range []string{"MINIO_HOSTNAME", "MINIO_ROOT_USER", "MINIO_ROOT_PASSWORD"} {
+	for _, k := range []string{"MINIO_HOSTNAME", "MINIO_ROOT_USER", "MINIO_ROOT_PASSWORD", "MINIO_VOLUME_SIZE"} {
 		if val, ok := v[k]; ok {
 			b.WriteString(k + "=" + val + "\n")
 		}
@@ -28,6 +39,10 @@ func minioEnv(v map[string]string) string {
 }
 
 func minioCompose(v map[string]string) string {
+	volName := v["MINIO_VOLUME_NAME"]
+	if volName == "" {
+		volName = "minio_data"
+	}
 	return `services:
   minio:
     image: minio/minio:latest
@@ -43,5 +58,6 @@ func minioCompose(v map[string]string) string {
       - minio_data:/data
 volumes:
   minio_data:
-`
+    external: true
+    name: ` + volName + "\n"
 }
