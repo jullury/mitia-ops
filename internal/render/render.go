@@ -69,14 +69,18 @@ func BuildRenderResult(k services.Kind, values map[string]string) (services.Rend
 	return res, nil
 }
 
-// WriteCompose writes only the non-secret docker-compose.yml.
-// It deliberately never writes a .env (secrets must not persist on disk).
+// WriteCompose writes only the non-secret docker-compose.yml. It deliberately
+// never writes a .env (secrets must not persist on disk). Kinds that need other
+// files at launch (e.g. cloudflared's config.yml) materialize them via the
+// web layer's launch-time prepare step.
 func WriteCompose(dir string, res services.RenderResult) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
 	if strings.TrimSpace(res.ComposeYAML) != "" {
-		return os.WriteFile(filepath.Join(dir, "docker-compose.yml"), []byte(res.ComposeYAML), 0o644)
+		if err := os.WriteFile(filepath.Join(dir, "docker-compose.yml"), []byte(res.ComposeYAML), 0o644); err != nil {
+			return err
+		}
 	}
 	return nil
 }

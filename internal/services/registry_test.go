@@ -59,6 +59,42 @@ func TestRegistryReadOnlyAndConfigURL(t *testing.T) {
 	}
 }
 
+func TestCloudflaredFields(t *testing.T) {
+	def, ok := Get(KindCloudflared)
+	if !ok {
+		t.Fatal("cloudflared definition missing")
+	}
+	if def.ReadOnly {
+		t.Fatal("cloudflared must be lifecycle-controlled")
+	}
+	var name, ingress *Field
+	for i := range def.Fields {
+		switch def.Fields[i].Key {
+		case "CF_TUNNEL":
+			if def.Fields[i].Type != FieldString {
+				t.Fatalf("CF_TUNNEL must be a string field, got %+v", def.Fields[i])
+			}
+			name = &def.Fields[i]
+		case "CF_INGRESS":
+			if def.Fields[i].Type != FieldList {
+				t.Fatalf("CF_INGRESS must be a list field, got %+v", def.Fields[i])
+			}
+			if len(def.Fields[i].Columns) != 2 {
+				t.Fatalf("CF_INGRESS must have two columns, got %+v", def.Fields[i].Columns)
+			}
+			if def.Fields[i].Columns[0].Suffix != "HOST" || def.Fields[i].Columns[1].Suffix != "SERVICE" {
+				t.Fatalf("CF_INGRESS columns wrong: %+v", def.Fields[i].Columns)
+			}
+			ingress = &def.Fields[i]
+		default:
+			t.Fatalf("unexpected cloudflared field %q (only CF_TUNNEL + CF_INGRESS, no stored credentials)", def.Fields[i].Key)
+		}
+	}
+	if name == nil || ingress == nil {
+		t.Fatalf("cloudflared definition missing expected fields: %+v", def.Fields)
+	}
+}
+
 func TestMailcowReadOnlyDefinition(t *testing.T) {
 	def, ok := Get(KindMailcow)
 	if !ok {

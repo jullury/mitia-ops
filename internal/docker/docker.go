@@ -44,8 +44,12 @@ func Status(dir string, r Runner) (string, error) {
 	return r.Run(dir, "ps", "--format", "json")
 }
 
+// Up ensures the service is running with the current on-disk config. The
+// deployment files (e.g. cloudflared's config.yml) are rewritten just before
+// `up` and are bind-mounted, so an unchanged-spec container must be recreated
+// for those content changes to take effect ("Start" must apply saved edits).
 func Up(dir string, r Runner) (string, error) {
-	return r.Run(dir, "up", "-d")
+	return r.Run(dir, "up", "-d", "--force-recreate")
 }
 
 func Down(dir string, r Runner) (string, error) {

@@ -1,7 +1,7 @@
 {{ define "content" }}
 <h1>mitia-ops <span class="sub">service control</span></h1>
 
-{{ if .Msg }}<div class="flash" role="status">✓ {{ .Msg }}</div>{{ end }}
+{{ if .Msg }}<div class="flash" role="status">✓ {{ linkify .Msg }}</div>{{ end }}
 
 <div class="card">
   <form method="post" action="/service/new" style="display:flex;flex-wrap:wrap;gap:.6rem;align-items:flex-end">

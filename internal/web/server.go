@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"html/template"
 	"net/http"
+	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -21,12 +23,30 @@ import (
 var tmplFS embed.FS
 
 type Config struct {
-	DB         *db.DB
-	Cipher     *crypto.Cipher
-	DeployDir  string
-	MailcowDir string // shared wrapper-owned mailcow checkout; used only for read-only status probe
-	Docker     docker.Runner
-	DockerRaw  docker.RawRunner
+	DB          *db.DB
+	Cipher      *crypto.Cipher
+	DeployDir   string
+	MailcowDir  string // shared wrapper-owned mailcow checkout; used only for read-only status probe
+	Docker      docker.Runner
+	DockerRaw   docker.RawRunner
+	Cloudflared CloudflaredCLI // optional: drives tunnel creation at launch for cloudflared services
+}
+
+// CloudflaredCLI is the subset of the cloudflared binary the app drives when
+// preparing a locally-managed tunnel at launch.
+type CloudflaredCLI interface {
+	LoggedIn() bool
+	// LoginURL starts (or restarts) the interactive cloudflared-login container
+	// and returns the Cloudflare authorization URL the user must open in a
+	// browser to complete the login.
+	LoginURL() (string, error)
+	// EnsureTunnel returns the tunnel id, creating it if needed. creds are the
+	// freshly-issued credentials for a tunnel created just now; they are nil
+	// when the tunnel already existed (callers reuse their cached copy).
+	EnsureTunnel(name string) (id string, creds []byte, err error)
+	// RouteDNS points the DNS CNAME for hostname at the named tunnel
+	// (idempotently), so saved ingress hostnames actually route to it.
+	RouteDNS(tunnel, hostname string) error
 }
 
 func New(cfg Config) *http.ServeMux {
@@ -35,10 +55,12 @@ func New(cfg Config) *http.ServeMux {
 	// same "content" name, parse base together with exactly one page per set
 	// so the block resolves without cross-page collision.
 	funcs := template.FuncMap{
-		"statusClass": statusClass,
-		"statusTitle": statusTitle,
-		"sizeNum":     sizeNum,
-		"sizeSuffix":  sizeSuffix,
+		"linkify":      linkify,
+		"statusClass":  statusClass,
+		"statusTitle":  statusTitle,
+		"sizeNum":      sizeNum,
+		"sizeSuffix":   sizeSuffix,
+		"listSuffixes": listSuffixes,
 	}
 	dashTmpl := template.Must(template.New("base.html").Funcs(funcs).ParseFS(tmplFS, "templates/base.html", "templates/dashboard.html"))
 	svcTmpl := template.Must(template.New("base.html").Funcs(funcs).ParseFS(tmplFS, "templates/base.html", "templates/service.html"))
@@ -62,6 +84,34 @@ type dashData struct {
 	Kinds    []services.Definition
 	Services []dashRow
 	Msg      string
+}
+
+// listSuffixes joins a FieldList's column suffixes (e.g. "HOST,SERVICE") for
+// the traffic-routing editor's JS row handling.
+func listSuffixes(cols []services.ListColumn) string {
+	parts := make([]string, len(cols))
+	for i, c := range cols {
+		parts[i] = c.Suffix
+	}
+	return strings.Join(parts, ",")
+}
+
+var urlRe = regexp.MustCompile(`https?://\S+`)
+
+// linkify escapes a flash message for safe HTML and wraps any http(s) URLs in
+// it in links that open in a new tab (e.g. the Cloudflare login authorization
+// URL the app surfaces in the web UI).
+func linkify(s string) template.HTML {
+	var b strings.Builder
+	last := 0
+	for _, m := range urlRe.FindAllStringIndex(s, -1) {
+		b.WriteString(template.HTMLEscapeString(s[last:m[0]]))
+		u := template.HTMLEscapeString(s[m[0]:m[1]])
+		b.WriteString(`<a href="` + u + `" target="_blank" rel="noopener">` + u + `</a>`)
+		last = m[1]
+	}
+	b.WriteString(template.HTMLEscapeString(s[last:]))
+	return template.HTML(b.String())
 }
 
 // sizeNum returns the numeric part of a canonical size value ("100G" -> "100").
@@ -207,7 +257,7 @@ func (s *server) showService(w http.ResponseWriter, r *http.Request) {
 	if text, ok := serviceMsg[msg]; ok {
 		msg = text
 	}
-	s.renderService(w, r, id, msg, false)
+	s.renderService(w, r, id, msg, r.URL.Query().Get("err") == "1")
 }
 
 // renderService re-renders a service's detail form. It is shared by the GET
@@ -227,7 +277,7 @@ func (s *server) renderService(w http.ResponseWriter, r *http.Request, id int64,
 		return
 	}
 	items, _ := s.cfg.DB.ConfigItems(id)
-	values, secrets := decryptValues(s.cfg.Cipher, def, items, false)
+	values, secrets, lists := decryptValues(s.cfg.Cipher, def, items, false)
 	url := ""
 	if def.ConfigURL != nil {
 		url = def.ConfigURL(values)
@@ -237,6 +287,7 @@ func (s *server) renderService(w http.ResponseWriter, r *http.Request, id int64,
 		Service:   svc,
 		Values:    values,
 		SecretSet: secrets,
+		Lists:     lists,
 		ConfigURL: url,
 		Msg:       msg,
 		MsgError:  msgErr,
@@ -247,8 +298,9 @@ func (s *server) renderService(w http.ResponseWriter, r *http.Request, id int64,
 type svcData struct {
 	Def       services.Definition
 	Service   *db.Service
-	Values    map[string]string // non-secret values for inputs (decrypted secrets excluded)
-	SecretSet map[string]bool   // field key -> true if a secret value is stored
+	Values    map[string]string              // non-secret values for inputs (decrypted secrets excluded)
+	SecretSet map[string]bool                // field key -> true if a secret value is stored
+	Lists     map[string][]map[string]string // FieldList key -> ordered rows (suffix -> value)
 	ConfigURL string
 	Msg       string // flash message
 	MsgError  bool   // true to render Msg as a danger/error notice
@@ -289,6 +341,15 @@ func (s *server) saveService(w http.ResponseWriter, r *http.Request) {
 	existing, _ := s.cfg.DB.ConfigItems(id)
 	items := make([]db.ConfigItem, 0, len(def.Fields))
 	values := map[string]string{}
+	stale := []string{} // stored FieldList keys dropped by this save
+	kept := map[string]bool{}
+	// form is a single-valued view of the form for FieldList row parsing.
+	form := map[string]string{}
+	for k, vs := range r.Form {
+		if len(vs) > 0 {
+			form[k] = vs[len(vs)-1]
+		}
+	}
 	for _, f := range def.Fields {
 		raw := strings.TrimSpace(r.FormValue(f.Key))
 		switch f.Type {
@@ -328,6 +389,40 @@ func (s *server) saveService(w http.ResponseWriter, r *http.Request) {
 				values[f.Key] = "true"
 			}
 			items = append(items, db.ConfigItem{Key: f.Key, Value: values[f.Key]})
+		case services.FieldList:
+			rows := services.ListRows(form, f.Key, f.Columns)
+			// A row with some (but not all) cells filled is a mistake; a
+			// completely blank row terminates the scan. Fully-empty rows are
+			// dropped, so a row of blanks doesn't persist empty keys.
+			for i, row := range rows {
+				hasEmpty, hasValue := false, false
+				for _, c := range f.Columns {
+					if row[c.Suffix] == "" {
+						hasEmpty = true
+					} else {
+						hasValue = true
+					}
+				}
+				if hasEmpty && hasValue {
+					s.renderService(w, r, id, fmt.Sprintf("%s rule %d: every field must be filled", f.Label, i+1), true)
+					return
+				}
+			}
+			for i, row := range rows {
+				for _, c := range f.Columns {
+					key := services.ListItemKey(f.Key, i, c.Suffix)
+					values[key] = row[c.Suffix]
+					items = append(items, db.ConfigItem{Key: key, Value: row[c.Suffix]})
+					kept[key] = true
+				}
+			}
+			// Any previously-stored row keys this save no longer produced are
+			// stale and must be removed (config_items upserts, never deletes).
+			for stored := range existing {
+				if strings.HasPrefix(stored, f.Key+"_") && !kept[stored] {
+					stale = append(stale, stored)
+				}
+			}
 		default:
 			values[f.Key] = raw
 			items = append(items, db.ConfigItem{Key: f.Key, Value: values[f.Key]})
@@ -365,6 +460,12 @@ func (s *server) saveService(w http.ResponseWriter, r *http.Request) {
 	if err := s.cfg.DB.SetConfigItems(id, items); err != nil {
 		s.renderService(w, r, id, err.Error(), true)
 		return
+	}
+	if len(stale) > 0 {
+		if err := s.cfg.DB.DeleteConfigItems(id, stale); err != nil {
+			s.renderService(w, r, id, err.Error(), true)
+			return
+		}
 	}
 	s.injectVolumeName(dir, id, def.Kind, values)
 	res, err := render.BuildRenderResult(def.Kind, values)
@@ -418,10 +519,28 @@ func (s *server) serviceAction(w http.ResponseWriter, r *http.Request) {
 
 	// For `up`, decrypt secrets from SQLite into a temporary .env for the
 	// duration of the composer command, then delete it (ephemeral .env).
-	if op == "up" {
+	var values map[string]string
+	if op == "up" || op == "restart" {
 		items, _ := s.cfg.DB.ConfigItems(id)
-		values, _ := decryptValues(s.cfg.Cipher, def, items, true)
+		values, _, _ = decryptValues(s.cfg.Cipher, def, items, true)
 		s.injectVolumeName(dir, id, def.Kind, values)
+
+		// Kinds with launch-time preparation (cloudflared) materialize files the
+		// compose mounts (credentials + config) right before `up`, and may fail
+		// with a user action needed (e.g. a missing `cloudflared tunnel login`).
+		// Such errors are surfaced as an inline prompt back on the service page.
+		if prep, ok := prepareFns[def.Kind]; ok {
+			if err := prep(s, dir, values); err != nil {
+				q := url.Values{}
+				q.Set("err", "1")
+				q.Set("msg", err.Error())
+				http.Redirect(w, r, "/service/"+itoa(id)+"?"+q.Encode(), http.StatusSeeOther)
+				return
+			}
+		}
+	}
+
+	if op == "up" {
 		if _, err := render.WriteEnvFile(dir, values); err != nil {
 			http.Error(w, err.Error(), 500)
 			return
@@ -475,6 +594,73 @@ func (s *server) serviceAction(w http.ResponseWriter, r *http.Request) {
 // size-limited named volume are resizable; others return an error.
 var resizeVolumeNames = map[services.Kind]string{
 	services.KindMinio: "minio_data",
+}
+
+// prepareFns maps kinds needing launch-time file materialization (driving the
+// cloudflared CLI: create/reuse the tunnel, then write the credentials and
+// config.yml the compose mounts) to the step run right before `up`|`restart`.
+var prepareFns = map[services.Kind]func(s *server, dir string, values map[string]string) error{
+	services.KindCloudflared: prepareCloudflared,
+}
+
+// prepareCloudflared resolves the tunnel for a cloudflared service at launch:
+// it requires a prior login (prompting the user to run the containerized
+// `cloudflared tunnel login` if the cert is missing), creates/reuses the named
+// tunnel, and writes creds.json and config.yml (resolved tunnel id + the saved
+// ingress rules) into the deploy dir before compose mounts them.
+func prepareCloudflared(s *server, dir string, values map[string]string) error {
+	cli := s.cfg.Cloudflared
+	if cli == nil {
+		return fmt.Errorf("cloudflared container runner is not configured")
+	}
+	name := strings.TrimSpace(values["CF_TUNNEL"])
+	if name == "" {
+		return fmt.Errorf("tunnel name is required")
+	}
+	// No cert.pem yet means no account login: start the login container, hand
+	// the user the Cloudflare authorization URL in the web UI, and stop until
+	// they have completed it.
+	if !cli.LoggedIn() {
+		loginURL, err := cli.LoginURL()
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("Cloudflare login required: open the authorization URL in your browser, complete the login, then press Start again. %s", loginURL)
+	}
+	id, creds, err := cli.EnsureTunnel(name)
+	if err != nil {
+		return err
+	}
+	// Point DNS at the tunnel so each saved ingress hostname actually routes:
+	// `cloudflared tunnel route dns` creates the CNAME (idempotently). A zone
+	// not present under this login fails here with a clear prompt.
+	for _, host := range services.CloudflaredIngressHosts(values) {
+		if err := cli.RouteDNS(name, host); err != nil {
+			return fmt.Errorf("routing %s to tunnel %q failed: %w", host, name, err)
+		}
+	}
+	// A freshly-created tunnel returns its credentials; a reused one has none,
+	// so fall back to the credentials a prior launch cached in this deploy dir.
+	if len(creds) == 0 {
+		creds, err = os.ReadFile(filepath.Join(dir, "creds.json"))
+		if err != nil {
+			return fmt.Errorf("tunnel %q already exists but no credentials are cached for it; delete this service and recreate the tunnel, or recreate the credentials on the host", name)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(dir, "creds.json"), creds, 0o600); err != nil {
+		return err
+	}
+	// The tunnel container runs cloudflared as the image's own uid, so it must
+	// be able to read this file: give it ownership when running as root, else
+	// make it world-readable (the same fallback EnsureHome uses).
+	if err := os.Chown(filepath.Join(dir, "creds.json"), 65532, 65532); err != nil {
+		_ = os.Chmod(filepath.Join(dir, "creds.json"), 0o644)
+	}
+	cfg, err := services.CloudflaredConfig(id, values)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(dir, "config.yml"), []byte(cfg), 0o644)
 }
 
 // injectVolumeName adds the MINIO_VOLUME_NAME the compose should mount to
@@ -652,18 +838,22 @@ func (s *server) statusDir(svc db.Service) string {
 	return s.deployDir(svc.ID)
 }
 
-// decryptValues returns a values map and, when includeSecrets is false, a
-// SecretSet map marking which secret fields already have a stored value.
-// Secrets are only included in the returned values when includeSecrets is
-// true (the launch-time path). For display, secrets are excluded from the
-// input values so stored secrets are never echoed back into the page.
-func decryptValues(c *crypto.Cipher, def services.Definition, items map[string]string, includeSecrets bool) (map[string]string, map[string]bool) {
+// decryptValues returns (values, secretSet, lists). values holds non-secret
+// inputs keyed by field key (plus invertible FieldList cells); secretSet marks
+// secret fields that already have a stored value. Secrets are only included in
+// the returned values when includeSecrets is true (the launch-time path). For
+// display, secrets are excluded from the input values so stored secrets are
+// never echoed back into the page. FieldList rows are returned separately in
+// lists (ordered rows keyed by column suffix), with a single blank row when no
+// rules are stored so the editor shows an empty row to fill in.
+func decryptValues(c *crypto.Cipher, def services.Definition, items map[string]string, includeSecrets bool) (map[string]string, map[string]bool, map[string][]map[string]string) {
 	out := map[string]string{}
 	secrets := map[string]bool{}
+	lists := map[string][]map[string]string{}
 	for _, f := range def.Fields {
-		raw := items[f.Key]
-		if f.Type == services.FieldSecret {
-			if raw != "" {
+		switch f.Type {
+		case services.FieldSecret:
+			if raw := items[f.Key]; raw != "" {
 				secrets[f.Key] = true
 				if includeSecrets {
 					if dec, err := c.Decrypt(raw); err == nil {
@@ -671,11 +861,22 @@ func decryptValues(c *crypto.Cipher, def services.Definition, items map[string]s
 					}
 				}
 			}
-		} else {
-			out[f.Key] = raw
+		case services.FieldList:
+			rows := services.ListRows(items, f.Key, f.Columns)
+			if len(rows) == 0 {
+				rows = append(rows, map[string]string{})
+			}
+			lists[f.Key] = rows
+			for i, row := range rows {
+				for _, col := range f.Columns {
+					out[services.ListItemKey(f.Key, i, col.Suffix)] = row[col.Suffix]
+				}
+			}
+		default:
+			out[f.Key] = items[f.Key]
 		}
 	}
-	return out, secrets
+	return out, secrets, lists
 }
 
 func idFromPath(w http.ResponseWriter, r *http.Request) int64 {

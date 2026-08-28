@@ -1,5 +1,10 @@
 package services
 
+import (
+	"fmt"
+	"strings"
+)
+
 const (
 	KindMinio       Kind = "minio"
 	KindMailcow     Kind = "mailcow"
@@ -16,6 +21,7 @@ const (
 	FieldSecret
 	FieldBool
 	FieldSize
+	FieldList
 )
 
 // SizeUnit describes one selectable unit in a FieldSize picker. Label is shown
@@ -28,6 +34,13 @@ type SizeUnit struct {
 	Base   int64
 }
 
+// ListColumn describes one input column of a FieldList row.
+type ListColumn struct {
+	Suffix      string // key suffix; row values live under "<listKey>_<n>_<suffix>"
+	Label       string
+	Placeholder string
+}
+
 type Field struct {
 	Key         string
 	Label       string
@@ -35,6 +48,38 @@ type Field struct {
 	Placeholder string
 	Hints       string
 	Units       []SizeUnit
+	Columns     []ListColumn // FieldList only
+}
+
+// ListItemKey names the config item holding one cell of a FieldList row.
+func ListItemKey(listKey string, n int, suffix string) string {
+	return fmt.Sprintf("%s_%d_%s", listKey, n, suffix)
+}
+
+// ListRows reads the rows stored for a FieldList key from a flat key/value map
+// (form values, config items, render values). Row cells live under
+// "<listKey>_<n>_<suffix>" keys; scanning stops at the first fully-empty row,
+// so the UI keeps rows contiguous (it renumbers on remove/add).
+func ListRows(values map[string]string, listKey string, columns []ListColumn) []map[string]string {
+	var rows []map[string]string
+	for n := 0; ; n++ {
+		row := make(map[string]string, len(columns))
+		any := false
+		for _, c := range columns {
+			v := ""
+			if values != nil {
+				v = strings.TrimSpace(values[ListItemKey(listKey, n, c.Suffix)])
+			}
+			row[c.Suffix] = v
+			if v != "" {
+				any = true
+			}
+		}
+		if !any {
+			return rows
+		}
+		rows = append(rows, row)
+	}
 }
 
 // SplitSize splits a canonical Docker size value ("100G") into its numeric and

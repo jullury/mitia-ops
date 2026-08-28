@@ -5,8 +5,10 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 
+	"github.com/jullury/mitia-ops/internal/cloudflared"
 	"github.com/jullury/mitia-ops/internal/crypto"
 	"github.com/jullury/mitia-ops/internal/db"
 	"github.com/jullury/mitia-ops/internal/docker"
@@ -71,13 +73,35 @@ func main() {
 	}
 
 	cli := docker.NewCLI()
+
+	// cloudflared runs through a cloudflare/cloudflared container (never a host
+	// install), so the host only needs docker. Its state — the login certificate
+	// (cert.pem) and per-tunnel credentials — lives in an app-managed home dir,
+	// default <deploy>/cloudflared, overridable via MITIAOPS_CLOUDFLARED_HOME.
+	cfHome := os.Getenv("MITIAOPS_CLOUDFLARED_HOME")
+	if cfHome == "" {
+		cfHome = filepath.Join(deployDir, "cloudflared")
+	}
+	if abs, err := filepath.Abs(cfHome); err == nil {
+		cfHome = abs
+	}
+	cf := cloudflared.New()
+	cf.Raw = cli
+	cf.Home = cfHome
+	// The cloudflared container runs as the image's uid (65532): create the
+	// home dir and make it writable by that uid (chown when possible, else
+	// world-writable) so login and tunnel-create can persist state in it.
+	if err := cf.EnsureHome(); err != nil {
+		log.Fatal(err)
+	}
 	mux := web.New(web.Config{
-		DB:         d,
-		Cipher:     cipher,
-		DeployDir:  deployDir,
-		MailcowDir: dataDir + "/mailcow",
-		Docker:     cli,
-		DockerRaw:  cli,
+		DB:          d,
+		Cipher:      cipher,
+		DeployDir:   deployDir,
+		MailcowDir:  dataDir + "/mailcow",
+		Docker:      cli,
+		DockerRaw:   cli,
+		Cloudflared: cf,
 	})
 	log.Printf("mitia-ops listening on %s", addr)
 	log.Fatal(http.ListenAndServe(addr, mux))

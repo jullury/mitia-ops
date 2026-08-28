@@ -12,7 +12,7 @@
   </div>
 </div>
 
-{{ if .Msg }}<div class="flash{{ if .MsgError }} error{{ end }}" role="status">{{ if .MsgError }}⚠ {{ else }}✓ {{ end }}{{ .Msg }}</div>{{ end }}
+{{ if .Msg }}<div class="flash{{ if .MsgError }} error{{ end }}" role="status">{{ if .MsgError }}⚠ {{ else }}✓ {{ end }}{{ linkify .Msg }}</div>{{ end }}
 
 <form method="post" action="/service/{{ .Service.ID }}" id="svcForm">
 
@@ -20,7 +20,7 @@
     <h2 class="card-title">Configuration</h2>
     <fieldset class="field-group">
       {{ range .Def.Fields }}
-      {{ if ne .Type 3 }} {{/* everything except FieldSize goes here */}}
+      {{ if and (ne .Type 3) (ne .Type 4) }} {{/* everything except FieldSize / FieldList goes here */}}
       {{ if eq .Type 2 }} {{/* FieldBool: label wraps control in a row */}}
       <div class="check-row">
         <input type="checkbox" id="{{ .Key }}" name="{{ .Key }}" {{ if eq (index $.Values .Key) "true" }}checked{{ end }}>
@@ -69,6 +69,41 @@
   </div>
   {{ end }}
 
+  {{ $hasRouting := false }}
+  {{ range .Def.Fields }}{{ if eq .Type 4 }}{{ $hasRouting = true }}{{ end }}{{ end }}
+  {{ if $hasRouting }} {{/* FieldList rows: traffic routing / ingress rules */}}
+  <div class="card">
+    <h2 class="card-title">Traffic routing</h2>
+    {{ range .Def.Fields }}
+    {{ if eq .Type 4 }}
+    <div class="list-rules" data-list="{{ .Key }}" data-columns="{{ listSuffixes .Columns }}">
+      {{ $rows := index $.Lists .Key }}
+      {{ $f := . }}
+      <div class="rule-row rule-head">
+        {{ range $c := $f.Columns }}<span>{{ $c.Label }}</span>{{ end }}
+        <span></span>
+      </div>
+      {{ range $n, $row := $rows }}
+      <div class="rule-row">
+        {{ range $c := $f.Columns }}
+        <input type="text" name="{{ $f.Key }}_{{ $n }}_{{ $c.Suffix }}" placeholder="{{ $c.Placeholder }}" value="{{ index $row $c.Suffix }}">
+        {{ end }}
+        <button type="button" class="btn danger icon-btn rule-remove" aria-label="Remove rule" title="Remove rule">×</button>
+      </div>
+      {{ end }}
+      <div class="rule-tools">
+        <button type="button" class="btn muted rule-add" title="Add rule">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+          Add rule
+        </button>
+      </div>
+    </div>
+    {{ if .Hints }}<p class="hint">{{ .Hints }}</p>{{ end }}
+    {{ end }}
+    {{ end }}
+  </div>
+  {{ end }}
+
   <div class="actions" style="margin-top:1rem">
     <button class="btn primary" type="submit" id="saveBtn">Save changes</button>
   </div>
@@ -94,6 +129,61 @@
     btn.disabled = true;
     btn.textContent = 'Saving…';
     return true;
+  });
+
+  function rows(group) {
+    return group.querySelectorAll('.rule-row:not(.rule-head)');
+  }
+
+  // Renumber every row's input names back to contiguous 0..n indices so the
+  // server's stop-at-first-empty-row parse keeps all rules.
+  function renumber(group) {
+    var cols = group.dataset.columns.split(',');
+    rows(group).forEach(function (row, n) {
+      var inputs = row.querySelectorAll('input');
+      inputs.forEach(function (inp, j) {
+        inp.name = group.dataset.list + '_' + n + '_' + cols[j];
+      });
+    });
+  }
+
+  function makeRow(group, n) {
+    var cols = group.dataset.columns.split(',');
+    var row = document.createElement('div');
+    row.className = 'rule-row';
+    cols.forEach(function (suffix) {
+      var inp = document.createElement('input');
+      inp.type = 'text';
+      inp.name = group.dataset.list + '_' + n + '_' + suffix;
+      row.appendChild(inp);
+    });
+    var rm = document.createElement('button');
+    rm.type = 'button';
+    rm.className = 'btn danger icon-btn rule-remove';
+    rm.setAttribute('aria-label', 'Remove rule');
+    rm.title = 'Remove rule';
+    rm.textContent = '×';
+    rm.addEventListener('click', function () {
+      row.remove();
+      renumber(group);
+      if (rows(group).length === 0) group.querySelector('.rule-add').click();
+    });
+    row.appendChild(rm);
+    return row;
+  }
+
+  document.querySelectorAll('[data-list]').forEach(function (group) {
+    var addBtn = group.querySelector('.rule-add');
+    addBtn.addEventListener('click', function () {
+      group.insertBefore(makeRow(group, rows(group).length), addBtn.parentNode);
+    });
+    rows(group).forEach(function (row) {
+      row.querySelector('.rule-remove').addEventListener('click', function () {
+        row.remove();
+        renumber(group);
+        if (rows(group).length === 0) addBtn.click();
+      });
+    });
   });
 })();
 </script>

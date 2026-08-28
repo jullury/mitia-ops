@@ -54,3 +54,44 @@ func TestCascadeDelete(t *testing.T) {
 		t.Fatal("expected foreign keys enabled")
 	}
 }
+
+func TestDeleteConfigItems(t *testing.T) {
+	d, _ := Open(filepath.Join(t.TempDir(), "test.db"))
+	defer d.Close()
+
+	id, _ := d.CreateService("cloudflared", "tun")
+	_ = d.SetConfigItems(id, []ConfigItem{
+		{Key: "CF_TUNNEL", Value: "t"},
+		{Key: "CF_INGRESS_0_HOST", Value: "a.example.com"},
+		{Key: "CF_INGRESS_0_SERVICE", Value: "http://localhost:80"},
+		{Key: "CF_INGRESS_1_HOST", Value: "b.example.com"},
+		{Key: "CF_INGRESS_1_SERVICE", Value: "http://localhost:81"},
+	})
+
+	if err := d.DeleteConfigItems(id, []string{"CF_INGRESS_1_HOST", "CF_INGRESS_1_SERVICE"}); err != nil {
+		t.Fatal(err)
+	}
+	items, _ := d.ConfigItems(id)
+	if items["CF_INGRESS_1_HOST"] != "" || items["CF_INGRESS_1_SERVICE"] != "" {
+		t.Fatalf("stale ingress keys should be deleted, got %+v", items)
+	}
+	if items["CF_INGRESS_0_HOST"] != "a.example.com" || items["CF_TUNNEL"] != "t" {
+		t.Fatalf("unrelated keys must survive, got %+v", items)
+	}
+
+	// deleting a non-existent / empty set is a no-op
+	if err := d.DeleteConfigItems(id, nil); err != nil {
+		t.Fatal(err)
+	}
+	// service scoping: no error when another service has no such keys
+	other, _ := d.CreateService("minio", "m")
+	_ = d.SetConfigItems(other, []ConfigItem{{Key: "CF_INGRESS_0_HOST", Value: "x"}})
+	if err := d.DeleteConfigItems(other, []string{"CF_INGRESS_0_HOST"}); err != nil {
+		t.Fatal(err)
+	}
+	// the first service's config is untouched by the other service's delete
+	items, _ = d.ConfigItems(id)
+	if items["CF_INGRESS_0_HOST"] != "a.example.com" {
+		t.Fatalf("delete must be scoped to the service, got %+v", items)
+	}
+}

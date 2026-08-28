@@ -104,6 +104,26 @@ func (d *DB) SetConfigItems(serviceID int64, items []ConfigItem) error {
 	return tx.Commit()
 }
 
+// DeleteConfigItems removes the given keys for a service. Keys that don't exist
+// are ignored; an empty key set is a no-op. Used to drop stale FieldList rows
+// (e.g. old CF_INGRESS_n_* cells) after a re-save shrinks the list.
+func (d *DB) DeleteConfigItems(serviceID int64, keys []string) error {
+	if len(keys) == 0 {
+		return nil
+	}
+	tx, err := d.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, k := range keys {
+		if _, err := tx.Exec("DELETE FROM config_items WHERE service_id = ? AND key = ?", serviceID, k); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 func (d *DB) ConfigItems(serviceID int64) (map[string]string, error) {
 	rows, err := d.db.Query("SELECT key, value FROM config_items WHERE service_id = ?", serviceID)
 	if err != nil {

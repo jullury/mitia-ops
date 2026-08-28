@@ -1,8 +1,10 @@
 package web
 
 import (
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -323,6 +325,421 @@ func TestDashboardMailcowShowsConfigLink(t *testing.T) {
 		if strings.Contains(body, btn) {
 			t.Fatalf("dashboard must not render lifecycle buttons for read-only mailcow (found %s): %s", btn, body)
 		}
+	}
+}
+
+func TestSaveCloudflaredPersistsIngressAndCompose(t *testing.T) {
+	dbDir := filepath.Join(t.TempDir(), "test.db")
+	d, err := db.Open(dbDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { d.Close() })
+	c, _ := crypto.New("master")
+	deployDir := t.TempDir()
+	h := New(Config{DB: d, Cipher: c, DeployDir: deployDir, Docker: &fakeRunner{}})
+
+	id, _ := d.CreateService("cloudflared", "tun")
+	form := "CF_TUNNEL=my-tunnel" +
+		"&CF_INGRESS_0_HOST=app.example.com&CF_INGRESS_0_SERVICE=http%3A%2F%2Flocalhost%3A8080" +
+		"&CF_INGRESS_1_HOST=web.example.com&CF_INGRESS_1_SERVICE=http%3A%2F%2Flocalhost%3A9001"
+	req := httptest.NewRequest("POST", "/service/"+itoa(id), strings.NewReader(form))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("save status %d: %s", rec.Code, rec.Body.String())
+	}
+
+	items, _ := d.ConfigItems(id)
+	if items["CF_INGRESS_0_HOST"] != "app.example.com" || items["CF_INGRESS_1_SERVICE"] != "http://localhost:9001" {
+		t.Fatalf("ingress rows not persisted: %+v", items)
+	}
+	if items["CF_TUNNEL"] != "my-tunnel" {
+		t.Fatalf("tunnel name not persisted: %+v", items)
+	}
+
+	dir := filepath.Join(deployDir, itoa(id))
+	if _, err := os.Stat(filepath.Join(dir, "docker-compose.yml")); err != nil {
+		t.Fatalf("save must write docker-compose.yml: %v", err)
+	}
+	// The resolved config.yml + creds are only materialized at launch (once the
+	// tunnel id is known), not at save time.
+	for _, file := range []string{"config.yml", "creds.json"} {
+		if _, err := os.Stat(filepath.Join(dir, file)); err == nil {
+			t.Fatalf("save must NOT write %s (written at launch instead): %v", file, err)
+		}
+	}
+}
+
+// fakeCloudflared stubs the cloudflared CLI for launch-time preparation tests.
+type fakeCloudflared struct {
+	routes *[]string
+}
+
+func (f fakeCloudflared) LoggedIn() bool { return true }
+func (f fakeCloudflared) LoginURL() (string, error) {
+	return "", errors.New("unexpected LoginURL on a logged-in run")
+}
+func (f fakeCloudflared) EnsureTunnel(string) (string, []byte, error) {
+	return testCFID, []byte(`{"AccountTag":"abc","TunnelID":"x","TunnelSecret":"y"}`), nil
+}
+func (f fakeCloudflared) RouteDNS(tunnel, hostname string) error {
+	if f.routes != nil {
+		*f.routes = append(*f.routes, tunnel+" "+hostname)
+	}
+	return nil
+}
+
+const testCFID = "6ff42ae9-29c3-4b8f-93b2-5b2acd3e737d"
+
+func TestUpCloudflaredWritesCredsAndConfig(t *testing.T) {
+	dbDir := filepath.Join(t.TempDir(), "test.db")
+	d, err := db.Open(dbDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { d.Close() })
+	c, _ := crypto.New("master")
+	deployDir := t.TempDir()
+	var routes []string
+	h := New(Config{DB: d, Cipher: c, DeployDir: deployDir, Docker: &fakeRunner{}, Cloudflared: fakeCloudflared{routes: &routes}})
+
+	id, _ := d.CreateService("cloudflared", "tun")
+	form := "CF_TUNNEL=my-tunnel&CF_INGRESS_0_HOST=app.example.com&CF_INGRESS_0_SERVICE=http%3A%2F%2Flocalhost%3A8080"
+	save := httptest.NewRequest("POST", "/service/"+itoa(id), strings.NewReader(form))
+	save.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, save)
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("save status %d", rec.Code)
+	}
+
+	up := httptest.NewRequest("POST", "/service/"+itoa(id)+"/action?op=up", nil)
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, up)
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("up status %d: %s", rec.Code, rec.Body.String())
+	}
+
+	dir := filepath.Join(deployDir, itoa(id))
+	cfgBytes, err := os.ReadFile(filepath.Join(dir, "config.yml"))
+	if err != nil {
+		t.Fatalf("launch must write config.yml: %v", err)
+	}
+	if !strings.Contains(string(cfgBytes), "tunnel: 6ff42ae9") ||
+		!strings.Contains(string(cfgBytes), "app.example.com") ||
+		!strings.Contains(string(cfgBytes), "http_status:404") {
+		t.Fatalf("config.yml wrong:\n%s", cfgBytes)
+	}
+	if !strings.Contains(string(cfgBytes), "/etc/cloudflared/creds.json") {
+		t.Fatalf("config.yml should reference the container creds path:\n%s", cfgBytes)
+	}
+	credsBytes, err := os.ReadFile(filepath.Join(dir, "creds.json"))
+	if err != nil {
+		t.Fatalf("launch must write creds.json: %v", err)
+	}
+	info, _ := os.Stat(filepath.Join(dir, "creds.json"))
+	perm := info.Mode().Perm()
+	// As root we chown creds.json to the container uid and keep 0600; otherwise
+	// it falls back to 0644 so the container uid can read it.
+	if perm != 0o600 && perm != 0o644 {
+		t.Fatalf("creds.json mode = %v, want 0600 or 0644", perm)
+	}
+	if !strings.Contains(string(credsBytes), "AccountTag") {
+		t.Fatalf("creds.json must hold the tunnel credentials: %s", credsBytes)
+	}
+	if want := "my-tunnel app.example.com"; strings.Join(routes, ",") != want {
+		t.Fatalf("RouteDNS calls = %v, want %v", routes, want)
+	}
+}
+
+// reuseCloudflared simulates an existing tunnel: no fresh credentials, so the
+// launch must reuse the cache from the deploy dir.
+type reuseCloudflared struct {
+	routes *[]string
+}
+
+func (r reuseCloudflared) LoggedIn() bool { return true }
+func (r reuseCloudflared) LoginURL() (string, error) {
+	return "", errors.New("unexpected LoginURL on a logged-in run")
+}
+func (r reuseCloudflared) EnsureTunnel(string) (string, []byte, error) {
+	return testCFID, nil, nil
+}
+func (r reuseCloudflared) RouteDNS(tunnel, hostname string) error {
+	if r.routes != nil {
+		*r.routes = append(*r.routes, tunnel+" "+hostname)
+	}
+	return nil
+}
+
+func TestUpCloudflaredReusesCachedCredsWhenTunnelExists(t *testing.T) {
+	d, err := db.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { d.Close() })
+	c, _ := crypto.New("master")
+	deployDir := t.TempDir()
+	h := New(Config{DB: d, Cipher: c, DeployDir: deployDir, Docker: &fakeRunner{}, Cloudflared: &reuseCloudflared{}})
+
+	id, _ := d.CreateService("cloudflared", "tun")
+	dir := filepath.Join(deployDir, itoa(id))
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cached := `{"AccountTag":"abc","TunnelID":"` + testCFID + `","TunnelSecret":"cached-secret"}`
+	if err := os.WriteFile(filepath.Join(dir, "creds.json"), []byte(cached), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	form := "CF_TUNNEL=my-tunnel&CF_INGRESS_0_HOST=app.example.com&CF_INGRESS_0_SERVICE=http%3A%2F%2Flocalhost%3A8080"
+	save := httptest.NewRequest("POST", "/service/"+itoa(id), strings.NewReader(form))
+	save.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, save)
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("save status %d", rec.Code)
+	}
+
+	up := httptest.NewRequest("POST", "/service/"+itoa(id)+"/action?op=up", nil)
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, up)
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("up status %d: %s", rec.Code, rec.Body.String())
+	}
+	if got := strings.TrimSpace(string(mustRead(t, filepath.Join(dir, "creds.json")))); got != cached {
+		t.Fatalf("credits must be preserved from the cached copy, got %s", got)
+	}
+}
+
+func TestUpCloudflaredErrorsWhenExistingTunnelHasNoCachedCreds(t *testing.T) {
+	d, err := db.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { d.Close() })
+	c, _ := crypto.New("master")
+	deployDir := t.TempDir()
+	h := New(Config{DB: d, Cipher: c, DeployDir: deployDir, Docker: &fakeRunner{}, Cloudflared: &reuseCloudflared{}})
+
+	id, _ := d.CreateService("cloudflared", "tun")
+	form := "CF_TUNNEL=my-tunnel&CF_INGRESS_0_HOST=app.example.com&CF_INGRESS_0_SERVICE=http%3A%2F%2Flocalhost%3A8080"
+	save := httptest.NewRequest("POST", "/service/"+itoa(id), strings.NewReader(form))
+	save.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, save)
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("save status %d", rec.Code)
+	}
+
+	up := httptest.NewRequest("POST", "/service/"+itoa(id)+"/action?op=up", nil)
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, up)
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("up should redirect with an error, got %d", rec.Code)
+	}
+	loc := rec.Header().Get("Location")
+	if !strings.Contains(loc, "err=1") {
+		t.Fatalf("expected an error redirect, got %v", loc)
+	}
+	decoded, _ := url.QueryUnescape(loc)
+	if !strings.Contains(decoded, "no credentials are cached") {
+		t.Fatalf("expected an explainable error redirect, got %v", loc)
+	}
+}
+
+func mustRead(t *testing.T, path string) []byte {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+func TestUpCloudflaredPromptsForLoginWhenNotLoggedIn(t *testing.T) {
+	// A missing `cloudflared tunnel login` (no cert.pem => not logged in) must
+	// be surfaced as an inline prompt back on the service page, not a bare
+	// error page.
+	d, err := db.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { d.Close() })
+	c, _ := crypto.New("master")
+	deployDir := t.TempDir()
+	h := New(Config{DB: d, Cipher: c, DeployDir: deployDir, Docker: &fakeRunner{},
+		Cloudflared: &notLoggedInCloudflared{}})
+
+	id, _ := d.CreateService("cloudflared", "tun")
+	form := "CF_TUNNEL=my-tunnel&CF_INGRESS_0_HOST=app.example.com&CF_INGRESS_0_SERVICE=http://localhost:8080"
+	save := httptest.NewRequest("POST", "/service/"+itoa(id), strings.NewReader(form))
+	save.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, save)
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("save status %d", rec.Code)
+	}
+
+	up := httptest.NewRequest("POST", "/service/"+itoa(id)+"/action?op=up", nil)
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, up)
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("up should redirect back to the service page, got %d", rec.Code)
+	}
+	if !strings.HasPrefix(rec.Header().Get("Location"), "/service/"+itoa(id)+"?") {
+		t.Fatalf("expected redirect to the service page, got %v", rec.Header().Get("Location"))
+	}
+
+	// The redirect target must render the login prompt as an inline error.
+	get := httptest.NewRequest("GET", rec.Header().Get("Location"), nil)
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, get)
+	if rec.Code != 200 {
+		t.Fatalf("get status %d", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "Cloudflare login required") {
+		t.Fatalf("expected login prompt inline, got: %s", body)
+	}
+	// The authorization URL must be surfaced as a link that opens in a new tab.
+	if !strings.Contains(body, `href="`+testLoginURL+`"`) {
+		t.Fatalf("login prompt must link the Cloudflare authorization URL, got: %s", body)
+	}
+	if !strings.Contains(body, `target="_blank"`) {
+		t.Fatalf("login link must open in a new tab, got: %s", body)
+	}
+}
+
+type notLoggedInCloudflared struct{ fakeCloudflared }
+
+func (notLoggedInCloudflared) LoggedIn() bool { return false }
+
+const testLoginURL = "https://dash.cloudflare.com/argotunnel?callback=xyz"
+
+func (notLoggedInCloudflared) LoginURL() (string, error) {
+	return testLoginURL, nil
+}
+
+func TestResaveCloudflaredRemovesStaleIngressRows(t *testing.T) {
+	d, err := db.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { d.Close() })
+	c, _ := crypto.New("master")
+	h := New(Config{DB: d, Cipher: c, DeployDir: t.TempDir(), Docker: &fakeRunner{}})
+	id, _ := d.CreateService("cloudflared", "tun")
+
+	save := func(form string) {
+		req := httptest.NewRequest("POST", "/service/"+itoa(id), strings.NewReader(form))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusSeeOther {
+			t.Fatalf("save status %d: %s", rec.Code, rec.Body.String())
+		}
+	}
+
+	save("CF_TUNNEL=my-tunnel&CF_INGRESS_0_HOST=a.ex&CF_INGRESS_0_SERVICE=http://localhost:80&CF_INGRESS_1_HOST=b.ex&CF_INGRESS_1_SERVICE=http://localhost:81")
+	items, _ := d.ConfigItems(id)
+	if items["CF_INGRESS_1_HOST"] != "b.ex" {
+		t.Fatalf("seed save missing second row: %+v", items)
+	}
+
+	// Re-save with one fewer rule: the removed row's keys must vanish.
+	save("CF_TUNNEL=my-tunnel&CF_INGRESS_0_HOST=a.ex&CF_INGRESS_0_SERVICE=http://localhost:80")
+	items, _ = d.ConfigItems(id)
+	if items["CF_INGRESS_1_HOST"] != "" || items["CF_INGRESS_1_SERVICE"] != "" {
+		t.Fatalf("stale ingress keys must be removed, got %+v", items)
+	}
+}
+
+func TestShowCloudflaredPrefillsRoutingRows(t *testing.T) {
+	d, h := testServer(t)
+	id, err := d.CreateService("cloudflared", "tun")
+	if err != nil {
+		t.Fatal(err)
+	}
+	form := "CF_TUNNEL=my-tunnel&CF_INGRESS_0_HOST=app.example.com&CF_INGRESS_0_SERVICE=http%3A%2F%2Flocalhost%3A8080"
+	req := httptest.NewRequest("POST", "/service/"+itoa(id), strings.NewReader(form))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("save status %d", rec.Code)
+	}
+
+	req = httptest.NewRequest("GET", "/service/"+itoa(id), nil)
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("get status %d", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `name="CF_INGRESS_0_HOST"`) {
+		t.Fatalf("routing host input missing: %s", body)
+	}
+	if !strings.Contains(body, `value="app.example.com"`) {
+		t.Fatalf("routing host value should pre-fill: %s", body)
+	}
+	if !strings.Contains(body, `name="CF_INGRESS_0_SERVICE"`) {
+		t.Fatalf("routing service input missing: %s", body)
+	}
+	if !strings.Contains(body, "Traffic routing") {
+		t.Fatalf("traffic routing card missing: %s", body)
+	}
+}
+
+func TestSaveCloudflaredRejectsPartialIngressRow(t *testing.T) {
+	d, err := db.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { d.Close() })
+	c, _ := crypto.New("master")
+	h := New(Config{DB: d, Cipher: c, DeployDir: t.TempDir(), Docker: &fakeRunner{}})
+	id, _ := d.CreateService("cloudflared", "tun")
+
+	form := "CF_TUNNEL=my-tunnel&CF_INGRESS_0_HOST=app.example.com"
+	req := httptest.NewRequest("POST", "/service/"+itoa(id), strings.NewReader(form))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("partial row should re-render the form with 200, got %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), `class="flash error"`) {
+		t.Fatalf("expected inline error flash: %s", rec.Body.String())
+	}
+	items, _ := d.ConfigItems(id)
+	if items["CF_INGRESS_0_HOST"] != "" || items["CF_TUNNEL"] != "" {
+		t.Fatalf("rejected save must not persist anything, got %+v", items)
+	}
+}
+
+func TestSaveCloudflaredRejectsMissingTunnelName(t *testing.T) {
+	d, err := db.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { d.Close() })
+	c, _ := crypto.New("master")
+	h := New(Config{DB: d, Cipher: c, DeployDir: t.TempDir(), Docker: &fakeRunner{}})
+	id, _ := d.CreateService("cloudflared", "tun")
+
+	form := "CF_INGRESS_0_HOST=app.example.com&CF_INGRESS_0_SERVICE=http://localhost:8080"
+	req := httptest.NewRequest("POST", "/service/"+itoa(id), strings.NewReader(form))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("missing tunnel name should re-render the form with 200, got %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), `class="flash error"`) {
+		t.Fatalf("expected inline error flash: %s", rec.Body.String())
 	}
 }
 
