@@ -58,3 +58,36 @@ func TestRegistryReadOnlyAndConfigURL(t *testing.T) {
 		}
 	}
 }
+
+func TestMailcowReadOnlyDefinition(t *testing.T) {
+	def, ok := Get(KindMailcow)
+	if !ok {
+		t.Fatal("mailcow definition missing")
+	}
+	if !def.ReadOnly {
+		t.Fatal("mailcow must be read-only")
+	}
+	if def.ConfigURL == nil {
+		t.Fatal("mailcow must provide a ConfigURL func")
+	}
+	if got := def.ConfigURL(map[string]string{"MAILCOW_HTTP_PORT": "8080"}); got != "http://localhost:8080" {
+		t.Fatalf("config url: got %q want %q", got, "http://localhost:8080")
+	}
+	if got := def.ConfigURL(map[string]string{}); got != "" {
+		t.Fatalf("config url with no port should be empty, got %q", got)
+	}
+	if len(def.Fields) != 1 {
+		t.Fatalf("mailcow must expose exactly one field, got %d", len(def.Fields))
+	}
+	if def.Fields[0].Key != "MAILCOW_HTTP_PORT" || def.Fields[0].Type != FieldString {
+		t.Fatalf("mailcow field wrong: %+v", def.Fields[0])
+	}
+
+	res, err := def.Render(map[string]string{"MAILCOW_HTTP_PORT": "8080"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.DotEnv != "" || res.ComposeYAML != "" {
+		t.Fatalf("mailcow render must be empty, got %+v", res)
+	}
+}
