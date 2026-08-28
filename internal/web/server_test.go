@@ -35,7 +35,8 @@ func testServer(t *testing.T) (*db.DB, http.Handler) {
 
 func TestDashboard(t *testing.T) {
 	d, h := testServer(t)
-	if _, err := d.CreateService("minio", "main"); err != nil {
+	id, err := d.CreateService("minio", "main")
+	if err != nil {
 		t.Fatal(err)
 	}
 	req := httptest.NewRequest("GET", "/", nil)
@@ -44,8 +45,28 @@ func TestDashboard(t *testing.T) {
 	if rec.Code != 200 {
 		t.Fatalf("status %d", rec.Code)
 	}
-	if !strings.Contains(rec.Body.String(), "minio") {
-		t.Fatalf("dashboard should list minio: %s", rec.Body.String())
+	body := rec.Body.String()
+	// assert a service-row-specific marker, not just "minio" (always present
+	// as a dropdown option)
+	if !strings.Contains(body, `href="/service/`+itoa(id)+`"`) {
+		t.Fatalf("dashboard should link to the service row: %s", body)
+	}
+	if !strings.Contains(body, "main") {
+		t.Fatalf("dashboard should show the service name in its row: %s", body)
+	}
+}
+
+func TestUnknownActionOpRejected(t *testing.T) {
+	d, h := testServer(t)
+	id, err := d.CreateService("minio", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest("POST", "/service/"+itoa(id)+"/action?op=explode", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("unknown op must be rejected with 400, got %d", rec.Code)
 	}
 }
 

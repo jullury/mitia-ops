@@ -191,11 +191,14 @@ func (s *server) serviceAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	op := r.URL.Query().Get("op")
+	if op != "up" && op != "down" && op != "restart" {
+		http.Error(w, "unknown op", 400)
+		return
+	}
 	dir := s.deployDir(id)
 
 	// For `up`, decrypt secrets from SQLite into a temporary .env for the
 	// duration of the composer command, then delete it (ephemeral .env).
-	var envPath string
 	if op == "up" {
 		svc, err := s.cfg.DB.ServiceByID(id)
 		if err != nil {
@@ -209,27 +212,24 @@ func (s *server) serviceAction(w http.ResponseWriter, r *http.Request) {
 		}
 		items, _ := s.cfg.DB.ConfigItems(id)
 		values := decryptValues(s.cfg.Cipher, def, items)
-		envPath, err = render.WriteEnvFile(dir, values)
-		if err != nil {
+		if _, err := render.WriteEnvFile(dir, values); err != nil {
 			http.Error(w, err.Error(), 500)
 			return
 		}
 		// Remove the temp .env no matter how the launch turns out.
 		defer render.RemoveEnvFile(dir)
-		_ = envPath
 	}
 
-	var out string
 	var err error
-	if op == "up" {
-		out, err = docker.Up(dir, s.cfg.Docker)
-	} else if op == "down" {
-		out, err = docker.Down(dir, s.cfg.Docker)
-	} else {
-		out, err = docker.Restart(dir, s.cfg.Docker)
+	switch op {
+	case "up":
+		_, err = docker.Up(dir, s.cfg.Docker)
+	case "down":
+		_, err = docker.Down(dir, s.cfg.Docker)
+	case "restart":
+		_, err = docker.Restart(dir, s.cfg.Docker)
 	}
 	if err != nil {
-		_ = out
 		http.Error(w, err.Error(), 500)
 		return
 	}
