@@ -15,7 +15,18 @@ const (
 	FieldString FieldType = iota
 	FieldSecret
 	FieldBool
+	FieldSize
 )
+
+// SizeUnit describes one selectable unit in a FieldSize picker. Label is shown
+// in the dropdown (e.g. "GB"), Suffix is the Docker size suffix stored in the
+// value (e.g. "G"), and Base is the multiplier in bytes used for
+// canonicalisation and free-space checks.
+type SizeUnit struct {
+	Label  string
+	Suffix string
+	Base   int64
+}
 
 type Field struct {
 	Key         string
@@ -23,6 +34,20 @@ type Field struct {
 	Type        FieldType
 	Placeholder string
 	Hints       string
+	Units       []SizeUnit
+}
+
+// SplitSize splits a canonical Docker size value ("100G") into its numeric and
+// unit-suffix parts for pre-filling a FieldSize picker.
+func SplitSize(v string) (num string, suffix string) {
+	if v == "" {
+		return "", ""
+	}
+	i := 0
+	for i < len(v) && v[i] >= '0' && v[i] <= '9' {
+		i++
+	}
+	return v[:i], v[i:]
 }
 
 type RenderResult struct {

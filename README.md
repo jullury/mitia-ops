@@ -27,7 +27,7 @@ stop / restart services via Docker.
 
 ## Services
 
-- **minio** — S3 object storage (+ console)
+- **minio** — S3 object storage (+ console). Its data volume (100G default) is entered with a numeric input + unit picker (MiB/GiB/TiB). Changing the size and saving resizes the live volume (this is the single resize action, replacing a separate resize form). Resizing is fail-safe: the current contents are copied to a local backup, the new volume is created and populated *before* the old one is removed, then the service restarts with the new volume. A free-space preflight aborts cleanly if the host lacks room for the new size.
 - **caddy** — reverse proxy + TLS
 - **cloudflared** — Cloudflare Tunnel
 - **mailcow** — mail server (read-only entry: exposes its config URL and a

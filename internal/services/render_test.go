@@ -11,6 +11,7 @@ func TestMinioRender(t *testing.T) {
 		"MINIO_HOSTNAME":      "s3.example.com",
 		"MINIO_ROOT_USER":     "admin",
 		"MINIO_ROOT_PASSWORD": "superSecret",
+		"MINIO_VOLUME_SIZE":   "100G",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -18,8 +19,17 @@ func TestMinioRender(t *testing.T) {
 	if !strings.Contains(res.DotEnv, "MINIO_ROOT_USER=admin") {
 		t.Fatalf("missing env: %q", res.DotEnv)
 	}
+	if !strings.Contains(res.DotEnv, "MINIO_VOLUME_SIZE=100G") {
+		t.Fatalf("missing volume size env: %q", res.DotEnv)
+	}
 	if !strings.Contains(res.ComposeYAML, "minio/minio") {
 		t.Fatalf("expected minio image in compose: %q", res.ComposeYAML)
+	}
+	if !strings.Contains(res.ComposeYAML, "external: true") {
+		t.Fatalf("expected minio data volume to be external: %q", res.ComposeYAML)
+	}
+	if !strings.Contains(res.ComposeYAML, "name: "+"minio_data") {
+		t.Fatalf("expected external volume name in compose: %q", res.ComposeYAML)
 	}
 }
 

@@ -91,3 +91,19 @@ func TestMailcowReadOnlyDefinition(t *testing.T) {
 		t.Fatalf("mailcow render must be empty, got %+v", res)
 	}
 }
+
+func TestSplitSize(t *testing.T) {
+	cases := map[string][2]string{
+		"100G": {"100", "G"},
+		"512M": {"512", "M"},
+		"1T":   {"1", "T"},
+		"100":  {"100", ""},
+		"":     {"", ""},
+	}
+	for in, want := range cases {
+		n, s := SplitSize(in)
+		if n != want[0] || s != want[1] {
+			t.Errorf("SplitSize(%q) = %q,%q; want %q,%q", in, n, s, want[0], want[1])
+		}
+	}
+}

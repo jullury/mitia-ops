@@ -1,23 +1,100 @@
 {{ define "content" }}
-<h1>{{ .Def.Label }}</h1>
-<p>Name: {{ .Service.Name }} &middot; Kind: {{ .Def.Kind }}</p>
-{{ if and .Def.ReadOnly .ConfigURL }}
-<p><a class="btn" href="{{ .ConfigURL }}" target="_blank" rel="noopener">Open config</a></p>
-{{ end }}
-<form method="post" action="/service/{{ .Service.ID }}">
-  {{ range .Def.Fields }}
-  <label for="{{ .Key }}">{{ .Label }}
-    {{ if .Hints }}<span class="hint">({{ .Hints }})</span>{{ end }}
-  </label>
-  {{ if eq .Type 2 }} {{/* FieldBool */}}
-  <input type="checkbox" id="{{ .Key }}" name="{{ .Key }}" {{ if eq (index $.Values .Key) "true" }}checked{{ end }}>
-  {{ else }}
-  <input type="{{ if eq .Type 1 }}password{{ else }}text{{ end }}"
-         id="{{ .Key }}" name="{{ .Key }}"
-         placeholder="{{ .Placeholder }}" value="{{ index $.Values .Key }}">
+<div class="page-head">
+  <div>
+    <h1>{{ .Def.Label }} <span class="sub">service</span></h1>
+    <p class="hint">Name: <strong>{{ .Service.Name }}</strong> &middot; ID: <span class="mono">{{ .Service.ID }}</span></p>
+  </div>
+  <div class="actions">
+    {{ if and .Def.ReadOnly .ConfigURL }}
+    <a class="btn" href="{{ .ConfigURL }}" target="_blank" rel="noopener">Open config</a>
+    {{ end }}
+    <a href="/" class="btn muted">← Services</a>
+  </div>
+</div>
+
+{{ if .Msg }}<div class="flash{{ if .MsgError }} error{{ end }}" role="status">{{ if .MsgError }}⚠ {{ else }}✓ {{ end }}{{ .Msg }}</div>{{ end }}
+
+<form method="post" action="/service/{{ .Service.ID }}" id="svcForm">
+
+  <div class="card">
+    <h2 class="card-title">Configuration</h2>
+    <fieldset class="field-group">
+      {{ range .Def.Fields }}
+      {{ if ne .Type 3 }} {{/* everything except FieldSize goes here */}}
+      {{ if eq .Type 2 }} {{/* FieldBool: label wraps control in a row */}}
+      <div class="check-row">
+        <input type="checkbox" id="{{ .Key }}" name="{{ .Key }}" {{ if eq (index $.Values .Key) "true" }}checked{{ end }}>
+        <label for="{{ .Key }}">{{ .Label }}</label>
+      </div>
+      {{ else }} {{/* FieldString / FieldSecret */}}
+      <div class="row">
+        <label for="{{ .Key }}">{{ .Label }}</label>
+        {{ if eq .Type 1 }} {{/* FieldSecret */}}
+        <input type="password" id="{{ .Key }}" name="{{ .Key }}" placeholder="••••••••"{{ if index $.SecretSet .Key }} title="A value is already stored"{{ end }}>
+        {{ if index $.SecretSet .Key }}<p class="hint">A value is saved &mdash; leave blank to keep it unchanged.</p>{{ end }}
+        {{ else }}
+        <input type="text" id="{{ .Key }}" name="{{ .Key }}" placeholder="{{ .Placeholder }}" value="{{ index $.Values .Key }}">
+        {{ end }}
+        {{ if .Hints }}<p class="hint">{{ .Hints }}</p>{{ end }}
+      </div>
+      {{ end }}
+      {{ end }}
+      {{ end }}
+    </fieldset>
+  </div>
+
+  {{ if .HasSize }} {{/* Storage / resizeable volume section */}}
+  <div class="card">
+    <h2 class="card-title">Storage</h2>
+    <fieldset class="field-group">
+      {{ range .Def.Fields }}
+      {{ if eq .Type 3 }} {{/* FieldSize */}}
+      <div class="row" data-resize data-current="{{ sizeNum (index $.Values .Key) }}{{ sizeSuffix (index $.Values .Key) }}">
+        <label for="{{ .Key }}">{{ .Label }}</label>
+        <div class="size-picker">
+          <input type="number" id="{{ .Key }}" name="{{ .Key }}" min="1" placeholder="100"
+                 value="{{ if index $.Values .Key }}{{ sizeNum (index $.Values .Key) }}{{ end }}">
+          <select name="{{ .Key }}_UNIT" aria-label="{{ .Label }} unit">
+            {{ $cur := sizeSuffix (index $.Values .Key) }}
+            {{ range .Units }}
+            <option value="{{ .Suffix }}" {{ if or (eq .Suffix $cur) (and (eq $cur "") (eq .Suffix "G")) }}selected{{ end }}>{{ .Label }}</option>
+            {{ end }}
+          </select>
+        </div>
+        <p class="hint">Changing the size and saving will resize the live volume while preserving your data &mdash; the service is briefly stopped and data is copied back.</p>
+      </div>
+      {{ end }}
+      {{ end }}
+    </fieldset>
+  </div>
   {{ end }}
-  {{ end }}
-  <p><button class="btn primary" type="submit">Save</button></p>
+
+  <div class="actions" style="margin-top:1rem">
+    <button class="btn primary" type="submit" id="saveBtn">Save changes</button>
+  </div>
 </form>
-<p><a href="/" class="btn">Back</a></p>
+
+<script>
+(function () {
+  var form = document.getElementById('svcForm');
+  var btn = document.getElementById('saveBtn');
+  var resizeRow = document.querySelector('[data-resize]');
+
+  form.addEventListener('submit', function () {
+    // Resize confirmation only applies when a size is already configured; a
+    // fresh service has no volume to resize, so its first save is a plain save.
+    if (resizeRow && resizeRow.dataset.current) {
+      var num = resizeRow.querySelector('input').value.trim();
+      var unit = resizeRow.querySelector('select').value;
+      if ((num + unit) !== resizeRow.dataset.current) {
+        var ok = confirm('Changing the volume size stops the service briefly and recreates the data volume at the new size. Continue?');
+        if (!ok) return false;
+      }
+    }
+    btn.disabled = true;
+    btn.textContent = 'Saving…';
+    return true;
+  });
+})();
+</script>
 {{ end }}
