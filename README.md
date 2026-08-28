@@ -28,7 +28,7 @@ stop / restart services via Docker.
 
 ## Services
 
-- **minio** — S3 object storage (+ console). Its data volume (100G default) is entered with a numeric input + unit picker (MiB/GiB/TiB). Changing the size and saving resizes the live volume (this is the single resize action, replacing a separate resize form). Resizing is fail-safe: the current contents are copied to a local backup, the new volume is created and populated *before* the old one is removed, then the service restarts with the new volume. A free-space preflight aborts cleanly if the host lacks room for the new size.
+- **minio** — S3 object storage (+ console). Its data volume (100G default) is entered with a numeric input + unit picker (MiB/GiB/TiB). The size is a *soft* upper bound used by the free-space preflight at launch and resize: Docker's local volume driver cannot enforce a hard size on persistent storage (the `size` mount option only works for RAM-backed tmpfs), so the volume itself is a plain local volume.
 - **caddy** — reverse proxy + TLS
 - **cloudflared** — Cloudflare Tunnel (locally-managed named tunnel). Only the
   tunnel name is required; no host install needed — the app runs cloudflared

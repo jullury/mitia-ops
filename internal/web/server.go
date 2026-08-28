@@ -569,7 +569,7 @@ func (s *server) serviceAction(w http.ResponseWriter, r *http.Request) {
 					http.Error(w, msg, status)
 					return
 				}
-				if err := docker.EnsureVolume(s.cfg.DockerRaw, name, size); err != nil {
+				if err := docker.EnsureVolume(s.cfg.DockerRaw, name); err != nil {
 					http.Error(w, err.Error(), 500)
 					return
 				}
@@ -828,7 +828,7 @@ func (s *server) doResize(w http.ResponseWriter, r *http.Request, id int64, def 
 		}
 	}
 	// 3. Create the new volume at the new size while the old one still exists.
-	if err := docker.CreateVolume(s.cfg.DockerRaw, newName, newSize); err != nil {
+	if err := docker.CreateVolume(s.cfg.DockerRaw, newName); err != nil {
 		http.Error(w, err.Error(), 500)
 		return
 	}

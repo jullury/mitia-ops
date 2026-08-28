@@ -22,24 +22,20 @@ func VolumeExists(raw RawRunner, volumeName string) (bool, error) {
 	return true, nil
 }
 
-// CreateVolume creates a sized local-driver volume. sizeOpt is a Docker size
-// string such as "100G" passed to the local driver's size mount option.
-func CreateVolume(raw RawRunner, volumeName, sizeOpt string) error {
-	device := "/var/lib/docker/volumes/" + volumeName + "/_data"
-	args := []string{"volume", "create", "--driver", "local",
-		"--opt", "type=none",
-		"--opt", "device=" + device,
-		"--opt", "o=size=" + sizeOpt,
-		volumeName,
-	}
+// CreateVolume creates a plain local-driver volume. Docker's local driver
+// cannot enforce a size on persistent storage (the size mount option is only
+// valid for tmpfs), so a size is deliberately not passed here: the configured
+// MINIO_VOLUME_SIZE is advisory and is only used for the free-space preflight.
+func CreateVolume(raw RawRunner, volumeName string) error {
+	args := []string{"volume", "create", "--driver", "local", volumeName}
 	if _, err := raw.RunRaw(args...); err != nil {
 		return fmt.Errorf("create volume %s: %w", volumeName, err)
 	}
 	return nil
 }
 
-// EnsureVolume creates volumeName at sizeOpt if it does not already exist.
-func EnsureVolume(raw RawRunner, volumeName, sizeOpt string) error {
+// EnsureVolume creates volumeName if it does not already exist.
+func EnsureVolume(raw RawRunner, volumeName string) error {
 	ok, err := VolumeExists(raw, volumeName)
 	if err != nil {
 		return err
@@ -47,7 +43,7 @@ func EnsureVolume(raw RawRunner, volumeName, sizeOpt string) error {
 	if ok {
 		return nil
 	}
-	return CreateVolume(raw, volumeName, sizeOpt)
+	return CreateVolume(raw, volumeName)
 }
 
 // BackupVolume archives the current contents of volume into backupDir as

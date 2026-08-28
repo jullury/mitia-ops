@@ -54,7 +54,7 @@ func TestVolumeName(t *testing.T) {
 
 func TestEnsureVolumeDoesNotRecreate(t *testing.T) {
 	r := &recordingRunner{exist: true}
-	if err := EnsureVolume(r, "12_minio_data", "100G"); err != nil {
+	if err := EnsureVolume(r, "12_minio_data"); err != nil {
 		t.Fatal(err)
 	}
 	if len(r.rawSeq) != 1 {
@@ -67,7 +67,7 @@ func TestEnsureVolumeDoesNotRecreate(t *testing.T) {
 
 func TestEnsureVolumeCreatesWhenMissing(t *testing.T) {
 	r := &recordingRunner{exist: false}
-	if err := EnsureVolume(r, "12_minio_data", "100G"); err != nil {
+	if err := EnsureVolume(r, "12_minio_data"); err != nil {
 		t.Fatal(err)
 	}
 	if len(r.rawSeq) != 2 {
@@ -76,22 +76,22 @@ func TestEnsureVolumeCreatesWhenMissing(t *testing.T) {
 	if r.rawSeq[1][0] != "volume" || r.rawSeq[1][1] != "create" {
 		t.Fatalf("expected volume create, got %v", r.rawSeq[1])
 	}
-	if !anyContains(r.rawSeq[1], "size=100G") {
-		t.Fatalf("create should carry the size opt, got %v", r.rawSeq[1])
+	if anyContains(r.rawSeq[1], "size=") || anyContains(r.rawSeq[1], "o=") {
+		t.Fatalf("create must be a plain local volume (no size/type/bind opts), got %v", r.rawSeq[1])
 	}
 }
 
-func TestCreateVolumeCarriesSizeOpt(t *testing.T) {
+func TestCreateVolumePlain(t *testing.T) {
 	r := &recordingRunner{}
-	if err := CreateVolume(r, "12_minio_data", "200G"); err != nil {
+	if err := CreateVolume(r, "12_minio_data"); err != nil {
 		t.Fatal(err)
 	}
 	last := r.rawSeq[len(r.rawSeq)-1]
-	if !anyContains(last, "size=200G") {
-		t.Fatalf("create should carry size=200G, got %v", last)
+	if !anyContains(last, "12_minio_data") {
+		t.Fatalf("create should carry the volume name, got %v", last)
 	}
-	if !anyContains(last, "volumes/12_minio_data/_data") {
-		t.Fatalf("create device should reference the volume mountpoint, got %v", last)
+	if anyContains(last, "size=") || anyContains(last, "type=") || anyContains(last, "device=") || anyContains(last, "o=") {
+		t.Fatalf("create must be a plain local volume, got %v", last)
 	}
 }
 
