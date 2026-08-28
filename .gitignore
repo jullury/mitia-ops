@@ -7,3 +7,4 @@ deployments/
 *.db
 *.db-wal
 *.db-shm
+.playwright-mcp/

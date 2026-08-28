@@ -70,11 +70,13 @@ func main() {
 		addr = ":8080"
 	}
 
+	cli := docker.NewCLI()
 	mux := web.New(web.Config{
 		DB:        d,
 		Cipher:    cipher,
 		DeployDir: deployDir,
-		Docker:    docker.NewCLI(),
+		Docker:    cli,
+		DockerRaw: cli,
 	})
 	log.Printf("mitia-ops listening on %s", addr)
 	log.Fatal(http.ListenAndServe(addr, mux))
