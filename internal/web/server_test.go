@@ -143,3 +143,36 @@ func TestMailcowLifecycleRejected(t *testing.T) {
 		}
 	}
 }
+
+func TestDashboardMailcowShowsConfigLink(t *testing.T) {
+	d, h := testServer(t)
+	id, err := d.CreateService("mailcow", "mail")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// set the http port so a config url can be derived
+	form := "MAILCOW_HTTP_PORT=8080"
+	req := httptest.NewRequest("POST", "/service/"+itoa(id), strings.NewReader(form))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("save status %d", rec.Code)
+	}
+
+	req = httptest.NewRequest("GET", "/", nil)
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("status %d", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `href="http://localhost:8080"`) {
+		t.Fatalf("dashboard should render the mailcow config url link: %s", body)
+	}
+	for _, btn := range []string{"?op=up", "?op=restart", "?op=down"} {
+		if strings.Contains(body, btn) {
+			t.Fatalf("dashboard must not render lifecycle buttons for read-only mailcow (found %s): %s", btn, body)
+		}
+	}
+}

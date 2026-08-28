@@ -1,6 +1,9 @@
 {{ define "content" }}
 <h1>{{ .Def.Label }}</h1>
 <p>Name: {{ .Service.Name }} &middot; Kind: {{ .Def.Kind }}</p>
+{{ if and .Def.ReadOnly .ConfigURL }}
+<p><a class="btn" href="{{ .ConfigURL }}" target="_blank" rel="noopener">Open config</a></p>
+{{ end }}
 <form method="post" action="/service/{{ .Service.ID }}">
   {{ range .Def.Fields }}
   <label for="{{ .Key }}">{{ .Label }}

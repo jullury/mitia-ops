@@ -55,7 +55,9 @@ type dashData struct {
 
 type dashRow struct {
 	db.Service
-	Status string
+	Status    string
+	ReadOnly  bool
+	ConfigURL string
 }
 
 func (s *server) dashboard(w http.ResponseWriter, r *http.Request) {
@@ -67,7 +69,21 @@ func (s *server) dashboard(w http.ResponseWriter, r *http.Request) {
 	rows := make([]dashRow, 0, len(svcs))
 	for _, svc := range svcs {
 		status, _ := docker.Status(s.statusDir(svc), s.cfg.Docker)
-		rows = append(rows, dashRow{Service: svc, Status: firstLine(status)})
+		url := ""
+		ro := false
+		if def, ok := services.Get(services.Kind(svc.Kind)); ok {
+			ro = def.ReadOnly
+			if ro && def.ConfigURL != nil {
+				items, _ := s.cfg.DB.ConfigItems(svc.ID)
+				url = def.ConfigURL(items)
+			}
+		}
+		rows = append(rows, dashRow{
+			Service:   svc,
+			Status:    firstLine(status),
+			ReadOnly:  ro,
+			ConfigURL: url,
+		})
 	}
 	s.dashTmpl.ExecuteTemplate(w, "base.html", dashData{Kinds: services.All(), Services: rows})
 }
@@ -103,11 +119,16 @@ func (s *server) showService(w http.ResponseWriter, r *http.Request) {
 	}
 	items, _ := s.cfg.DB.ConfigItems(id)
 	values := decryptValues(s.cfg.Cipher, def, items)
+	url := ""
+	if def.ConfigURL != nil {
+		url = def.ConfigURL(values)
+	}
 	s.svcTmpl.ExecuteTemplate(w, "base.html", struct {
-		Def     services.Definition
-		Service *db.Service
-		Values  map[string]string
-	}{def, svc, values})
+		Def       services.Definition
+		Service   *db.Service
+		Values    map[string]string
+		ConfigURL string
+	}{def, svc, values, url})
 }
 
 func (s *server) saveService(w http.ResponseWriter, r *http.Request) {
