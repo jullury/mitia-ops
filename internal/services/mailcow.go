@@ -1,5 +1,7 @@
 package services
 
+import "strings"
+
 func init() {
 	register(Definition{
 		Kind:  KindMailcow,
@@ -17,5 +19,11 @@ func init() {
 }
 
 func mailcowEnv(v map[string]string) string {
-	return "" // filled in Task 6
+	var b strings.Builder
+	for _, k := range []string{"MAILCOW_HOSTNAME", "MAILCOW_TZ", "MAILCOW_HTTP_PORT", "MAILCOW_HTTPS_PORT"} {
+		if val, ok := v[k]; ok {
+			b.WriteString(k + "=" + val + "\n")
+		}
+	}
+	return b.String()
 }

@@ -1,5 +1,7 @@
 package services
 
+import "strings"
+
 func init() {
 	register(Definition{
 		Kind:  KindCaddy,
@@ -14,6 +16,32 @@ func init() {
 	})
 }
 
-func caddyEnv(v map[string]string) string { return "" }
+func caddyEnv(v map[string]string) string {
+	var b strings.Builder
+	for _, k := range []string{"CADDY_DOMAIN", "CADDY_EMAIL"} {
+		if val, ok := v[k]; ok {
+			b.WriteString(k + "=" + val + "\n")
+		}
+	}
+	return b.String()
+}
 
-func caddyCompose(v map[string]string) string { return "" }
+func caddyCompose(v map[string]string) string {
+	return `services:
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: ${CADDY_DOMAIN}
+      ACME_EMAIL: ${CADDY_EMAIL}
+    volumes:
+      - caddy_data:/data
+      - caddy_config:/config
+volumes:
+  caddy_data:
+  caddy_config:
+`
+}
