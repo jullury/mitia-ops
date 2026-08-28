@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bufio"
 	"log"
 	"net/http"
 	"os"
+	"strings"
 
 	"github.com/jullury/mitia-ops/internal/crypto"
 	"github.com/jullury/mitia-ops/internal/db"
@@ -11,7 +13,27 @@ import (
 	"github.com/jullury/mitia-ops/internal/web"
 )
 
+func loadDotEnv(path string) {
+	f, err := os.Open(path)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		k, v, ok := strings.Cut(line, "=")
+		if ok && os.Getenv(k) == "" {
+			os.Setenv(k, v)
+		}
+	}
+}
+
 func main() {
+	loadDotEnv(".env")
 	masterKey := os.Getenv("MITIAOPS_KEY")
 	if masterKey == "" {
 		if kb, err := os.ReadFile(os.Getenv("MITIAOPS_KEY_FILE")); err == nil {
