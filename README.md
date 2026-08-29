@@ -9,8 +9,7 @@ Go binary with a minimal web UI. Configuration is stored in SQLite with secrets
 encrypted at rest; the app generates the non-secret `docker-compose.yml`
 persistently and drives Docker (start / stop / restart).
 
-> **Status:** mailcow and Caddy are currently **not fully working** — they are
-> work in progress.
+> **Status:** Caddy is currently **not fully working** — it is work in progress.
 
 ## About the name
 
@@ -66,6 +65,57 @@ make vet            # go vet
 
 See [`.env.example`](.env.example) for a copy-paste template.
 
+## Install (start on boot)
+
+There is no Docker container for mitia-ops itself — run the binary under
+systemd so it (and, via the *Start on boot* per-service flags, your whole stack)
+comes back after a reboot:
+
+```sh
+make build
+sudo make install     # -> scripts/install.sh
+```
+
+That installs a fixed layout:
+
+| Path                     | Purpose                                        |
+|--------------------------|------------------------------------------------|
+| `/usr/local/bin/mitia-ops` | the binary                                     |
+| `/var/lib/mitia-ops`     | `WorkingDirectory` (`data/`, `deployments/`)   |
+| `/etc/mitia-ops/env`     | `EnvironmentFile` (e.g. `MITIAOPS_ADDR`)       |
+| `/etc/mitia-ops/key`     | master key via `MITIAOPS_KEY_FILE` (0600)      |
+
+The installer is idempotent and safe on an existing deploy: it never clobbers
+`/etc/mitia-ops/env`, migrates `data/`/`deployments/` from the checkout only
+into an empty target, and refuses to invent a master key when an encrypted
+store already exists (a wrong key would lock you out of your secrets — point
+`/etc/mitia-ops/env` at your existing key instead). The unit runs as root
+(`NoNewPrivileges=true`, `PrivateTmp=true`), restarts on failure, and starts
+after `network-online.target`; if an old manually-launched instance is running
+it is stopped first so systemd can take over the listen port.
+
+Boot order: host boots → systemd starts mitia-ops → `AutoStart()` re-ups every
+service flagged *Start on boot* → your stack is reachable again.
+
+**Accessing the dashboard on a headless VPS.** By default the dashboard binds
+`MITIAOPS_ADDR` (default `:8080`) on **all** interfaces. On a public VPS you
+usually want it reachable only from your workstation — bind to loopback and
+tunnel in:
+
+```sh
+echo MITIAOPS_ADDR=127.0.0.1:8080 >> /etc/mitia-ops/env
+systemctl restart mitia-ops
+
+# from your workstation:
+ssh -L 8080:127.0.0.1:8080 user@vps
+# now open http://localhost:8080
+```
+
+Forward any other service port the same way in the same SSH command, e.g. the
+mailcow HTTP UI (`ssh -L 8080:127.0.0.1:8080 -L 2111:127.0.0.1:2111 user@vps`,
+then `http://localhost:2111`). Alternatively keep `:8080` public and put the
+dashboard behind cloudflared, which the app can drive for you (see below).
+
 ## Services
 
 - **minio** — S3 object storage (+ console). Its data volume (100G default) is
@@ -75,9 +125,25 @@ See [`.env.example`](.env.example) for a copy-paste template.
   `size` mount option only works for RAM-backed tmpfs), so the volume itself is a
   plain local volume.
 - **caddy** — reverse proxy + TLS. **Not fully working yet (WIP).**
-- **mailcow** — mail server. **Not fully working yet (WIP):** currently a
-  read-only entry exposing a config URL and status probe; lifecycle is not yet
-  wired through the app.
+- **mailcow** — mail server. On first **Start** the app clones the official
+  [`mailcow/mailcow-dockerized`](https://github.com/mailcow/mailcow-dockerized)
+  repository into the service's deploy directory, writes a `mailcow.conf` (with
+  your hostname ports and freshly-generated DB/API secrets), and creates the
+  `.env → mailcow.conf` symlink the official stack expects. Edits to the
+  hostname/ports/TZ are reconciled into the existing `mailcow.conf` on the next
+  **Start** (only the app-managed lines; operator tweaks are left alone), so
+  changing the HTTP port in the form genuinely re-binds nginx when the stack is
+  recreated — no need to wipe the service. The generated DB/Redis/API
+  credentials are persisted encrypted (in the app's SQLite store) on first
+  deploy, so even a wiped/re-cloned checkout keeps the same secrets — the named
+  volumes the stack mounts stay in sync and the dashboard keeps answering.
+  Start/Stop/Restart then
+  drive the official compose stack; the **Open config** link opens
+  `http://localhost:<port>` once you've set an HTTP port. Requires `git` and
+  internet on the host for the initial deploy. Because the first **Start** clones
+  and pulls a large stack, it runs in the background — the page returns
+  immediately and shows live progress (cloning, pulling images, running) plus any
+  error, instead of hanging on a spinner.
 - **cloudflared** — Cloudflare Tunnel (locally-managed named tunnel). Only the
   tunnel name is required; no host install needed — the app runs cloudflared
   through a `cloudflare/cloudflared` container. On first start it drives
@@ -102,8 +168,14 @@ See [`.env.example`](.env.example) for a copy-paste template.
   Cloudflare zone, so newly added routes become reachable without touching the
   dashboard. Start always recreates the container so bind-mounted config changes
   (new routes) take effect.
-- **mailcow** — mail server (read-only entry: exposes its config URL and a status
-  probe; the wrapper owns the `<data>/mailcow/` checkout and lifecycle).
+- **mailcow** — see the mailcow entry above.
+- **Start on boot** — every service page has a *Start on boot* checkbox
+  (universal, not a per-kind field). When the app process starts it brings up
+  every flagged service (runs Start in the background, per service), so a host
+  reboot followed by the app re-launching restores your stack automatically.
+  A service that fails to come up (e.g. still missing required config) is logged
+  and left alone — it won't take other services down. Note this relies on the
+  app itself starting at boot; run it under systemd to make it a full boot path.
 
 ## Layout
 

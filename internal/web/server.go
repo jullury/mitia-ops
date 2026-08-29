@@ -2,15 +2,19 @@ package web
 
 import (
 	"embed"
+	"errors"
 	"fmt"
 	"html/template"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/jullury/mitia-ops/internal/crypto"
 	"github.com/jullury/mitia-ops/internal/db"
@@ -26,7 +30,6 @@ type Config struct {
 	DB          *db.DB
 	Cipher      *crypto.Cipher
 	DeployDir   string
-	MailcowDir  string // shared wrapper-owned mailcow checkout; used only for read-only status probe
 	Docker      docker.Runner
 	DockerRaw   docker.RawRunner
 	Cloudflared CloudflaredCLI // optional: drives tunnel creation at launch for cloudflared services
@@ -49,7 +52,7 @@ type CloudflaredCLI interface {
 	RouteDNS(tunnel, hostname string) error
 }
 
-func New(cfg Config) *http.ServeMux {
+func New(cfg Config) *App {
 	// base.html provides the shared layout via `{{ template "content" . }}`,
 	// and each page defines that content block. Because every page uses the
 	// same "content" name, parse base together with exactly one page per set
@@ -64,7 +67,7 @@ func New(cfg Config) *http.ServeMux {
 	}
 	dashTmpl := template.Must(template.New("base.html").Funcs(funcs).ParseFS(tmplFS, "templates/base.html", "templates/dashboard.html"))
 	svcTmpl := template.Must(template.New("base.html").Funcs(funcs).ParseFS(tmplFS, "templates/base.html", "templates/service.html"))
-	s := &server{cfg: cfg, dashTmpl: dashTmpl, svcTmpl: svcTmpl}
+	s := &server{cfg: cfg, dashTmpl: dashTmpl, svcTmpl: svcTmpl, jobs: newJobTracker()}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", s.dashboard)
 	mux.HandleFunc("POST /service/new", s.newService)
@@ -72,13 +75,85 @@ func New(cfg Config) *http.ServeMux {
 	mux.HandleFunc("POST /service/{id}", s.saveService)
 	mux.HandleFunc("POST /service/{id}/action", s.serviceAction)
 	mux.HandleFunc("POST /service/{id}/delete", s.deleteService)
-	return mux
+	mux.HandleFunc("GET /service/{id}/status", s.serviceStatus)
+	return &App{mux: mux, s: s}
+}
+
+// App is the mitia-ops web application: an http.Handler carrying the routes
+// plus a startup hook that restores previously-running services (see
+// AutoStart).
+type App struct {
+	mux *http.ServeMux
+	s   *server
+}
+
+func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	a.mux.ServeHTTP(w, r)
+}
+
+// AutoStart brings up every service flagged "start on boot", one background
+// goroutine per service. Call it once at process startup, after the DB and
+// Docker runner are ready, so an app restart (host reboot included) restores
+// the previously-running stack. Failures are logged per service, never fatal —
+// a service missing required config surfaces through its own UI as usual.
+func (a *App) AutoStart() {
+	a.s.AutoStart()
 }
 
 type server struct {
 	cfg      Config
 	dashTmpl *template.Template
 	svcTmpl  *template.Template
+	jobs     *jobTracker
+}
+
+// JobState is the coarse lifecycle state of a long-running background
+// deployment (used by mailcow, whose first start clones and pulls a large
+// stack). The UI polls serviceStatus and humanises these states.
+type JobState string
+
+const (
+	JobCloning JobState = "cloning"
+	JobPulling JobState = "pulling"
+	JobRunning JobState = "running"
+	JobError   JobState = "error"
+)
+
+// job is one in-flight background deployment for a single service.
+type job struct {
+	state JobState
+	msg   string
+	err   string
+}
+
+// jobTracker holds the current background deployment job per service id. It is
+// intentionally simple: one job per service, retained briefly after it ends so
+// the polling UI can read the final state before it clears.
+type jobTracker struct {
+	mu   sync.Mutex
+	jobs map[int64]job
+}
+
+func newJobTracker() *jobTracker {
+	return &jobTracker{jobs: map[int64]job{}}
+}
+
+func (t *jobTracker) set(id int64, state JobState, msg, err string) {
+	t.mu.Lock()
+	t.jobs[id] = job{state: state, msg: msg, err: err}
+	t.mu.Unlock()
+}
+
+func (t *jobTracker) get(id int64) (job, bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	j, ok := t.jobs[id]
+	return j, ok
+}
+
+func (t *jobTracker) active(id int64) bool {
+	j, ok := t.get(id)
+	return ok && (j.state == JobCloning || j.state == JobPulling)
 }
 
 type dashData struct {
@@ -140,6 +215,8 @@ type dashRow struct {
 	Status    string
 	ReadOnly  bool
 	ConfigURL string
+	JobState  string
+	JobMsg    string
 }
 
 var stateRe = regexp.MustCompile(`"State":\s*"([a-zA-Z]+)"`)
@@ -221,9 +298,16 @@ func (s *server) dashboard(w http.ResponseWriter, r *http.Request) {
 		ro := false
 		if def, ok := services.Get(services.Kind(svc.Kind)); ok {
 			ro = def.ReadOnly
-			if ro && def.ConfigURL != nil {
+			if def.ConfigURL != nil {
 				items, _ := s.cfg.DB.ConfigItems(svc.ID)
 				url = def.ConfigURL(items)
+			}
+		}
+		jobState, jobMsg := "", ""
+		if j, ok := s.jobs.get(svc.ID); ok {
+			jobState = string(j.state)
+			if jobState != string(JobError) {
+				jobMsg = j.msg
 			}
 		}
 		rows = append(rows, dashRow{
@@ -231,6 +315,8 @@ func (s *server) dashboard(w http.ResponseWriter, r *http.Request) {
 			Status:    status,
 			ReadOnly:  ro,
 			ConfigURL: url,
+			JobState:  jobState,
+			JobMsg:    jobMsg,
 		})
 	}
 	msg := actionMsg[r.URL.Query().Get("msg")]
@@ -285,6 +371,13 @@ func (s *server) renderService(w http.ResponseWriter, r *http.Request, id int64,
 	if def.ConfigURL != nil {
 		url = def.ConfigURL(values)
 	}
+	jobState, jobMsg := "", ""
+	if j, ok := s.jobs.get(id); ok {
+		jobState = string(j.state)
+		if jobState != string(JobError) {
+			jobMsg = j.msg
+		}
+	}
 	s.svcTmpl.ExecuteTemplate(w, "base.html", svcData{
 		Def:       def,
 		Service:   svc,
@@ -295,6 +388,9 @@ func (s *server) renderService(w http.ResponseWriter, r *http.Request, id int64,
 		Msg:       msg,
 		MsgError:  msgErr,
 		HasSize:   hasSizeField(def),
+		Autostart: items[autostartKey] == "true",
+		JobState:  jobState,
+		JobMsg:    jobMsg,
 	})
 }
 
@@ -308,6 +404,9 @@ type svcData struct {
 	Msg       string // flash message
 	MsgError  bool   // true to render Msg as a danger/error notice
 	HasSize   bool   // true if the service has a FieldSize (resizeable volume)
+	Autostart bool   // true if the service is flagged to start on boot
+	JobState  string // background deployment state, or "" when none
+	JobMsg    string // human-readable progress message for the job
 }
 
 // hasSizeField reports whether a definition declares a FieldSize field (i.e. a
@@ -431,6 +530,13 @@ func (s *server) saveService(w http.ResponseWriter, r *http.Request) {
 			items = append(items, db.ConfigItem{Key: f.Key, Value: values[f.Key]})
 		}
 	}
+	// Start-on-boot is a universal toggle, not a kind field: a checked box
+	// keeps the service running across app restarts / host reboots.
+	autostart := "false"
+	if r.FormValue(autostartKey) != "" {
+		autostart = "true"
+	}
+	items = append(items, db.ConfigItem{Key: autostartKey, Value: autostart})
 	dir := s.deployDir(id)
 
 	// A change to a resizeable data volume's size is preflighted for free space
@@ -503,8 +609,6 @@ func (s *server) serviceAction(w http.ResponseWriter, r *http.Request) {
 	}
 	dir := s.deployDir(id)
 
-	// Read-only kinds (e.g. mailcow) have no lifecycle control: reject any
-	// up/down/restart before touching docker or any temporary .env.
 	svc, err := s.cfg.DB.ServiceByID(id)
 	if err != nil {
 		http.NotFound(w, r)
@@ -520,18 +624,44 @@ func (s *server) serviceAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// For `up`, decrypt secrets from SQLite into a temporary .env for the
-	// duration of the composer command, then delete it (ephemeral .env).
-	var values map[string]string
-	if op == "up" || op == "restart" {
-		items, _ := s.cfg.DB.ConfigItems(id)
-		values, _, _ = decryptValues(s.cfg.Cipher, def, items, true)
-		s.injectVolumeName(dir, id, def.Kind, values)
+	// The mailcow first start clones its repository and pulls a large stack, so
+	// its `up` runs in the background and the handler returns immediately; the
+	// UI polls /service/{id}/status for live progress. `down` and `restart`
+	// stay synchronous because the deployment is already on disk by then.
+	if def.Kind == services.KindMailcow && op == "up" {
+		s.startMailcowUp(id)
+		http.Redirect(w, r, "/service/"+itoa(id)+"?deploying=1", http.StatusSeeOther)
+		return
+	}
 
-		// Kinds with launch-time preparation (cloudflared) materialize files the
-		// compose mounts (credentials + config) right before `up`, and may fail
-		// with a user action needed (e.g. a missing `cloudflared tunnel login`).
-		// Such errors are surfaced as an inline prompt back on the service page.
+	// A non-mailcow `up` runs through the shared upService (prepare, ephemeral
+	// .env, volume ensure, `compose up -d --force-recreate`). A prepare failure
+	// is "user action needed" and is surfaced as an inline prompt back on the
+	// service page; every other failure is an internal error.
+	if op == "up" {
+		if err := s.upService(id); err != nil {
+			var prepErr *servicePrepareError
+			if errors.As(err, &prepErr) {
+				q := url.Values{}
+				q.Set("err", "1")
+				q.Set("msg", prepErr.err.Error())
+				http.Redirect(w, r, "/service/"+itoa(id)+"?"+q.Encode(), http.StatusSeeOther)
+			} else {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+			}
+			return
+		}
+		http.Redirect(w, r, "/?msg=up", http.StatusSeeOther)
+		return
+	}
+
+	// `restart` materializes launch-time files (cloudflared config, mailcow
+	// conf) right before restarting the containers, and may fail with a user
+	// action needed; those failures are prompted inline back on the page.
+	if op == "restart" {
+		items, _ := s.cfg.DB.ConfigItems(id)
+		values, _, _ := decryptValues(s.cfg.Cipher, def, items, true)
+		s.injectVolumeName(dir, id, def.Kind, values)
 		if prep, ok := prepareFns[def.Kind]; ok {
 			if err := prep(s, dir, values); err != nil {
 				q := url.Values{}
@@ -543,43 +673,7 @@ func (s *server) serviceAction(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if op == "up" {
-		if _, err := render.WriteEnvFile(dir, values); err != nil {
-			http.Error(w, err.Error(), 500)
-			return
-		}
-		// Remove the temp .env no matter how the launch turns out.
-		defer render.RemoveEnvFile(dir)
-
-		// The resizeable data volume is external: make sure it exists (at its
-		// configured size) before compose mounts it.
-		if s.cfg.DockerRaw != nil {
-			if namedVolume, ok := resizeVolumeNames[def.Kind]; ok {
-				name := values["MINIO_VOLUME_NAME"]
-				if name == "" {
-					name = docker.VolumeName(dir, namedVolume)
-				}
-				size := values["MINIO_VOLUME_SIZE"]
-				if size == "" {
-					size = "100G"
-				}
-				// Reject a configured size the disk can't fit before Docker
-				// tries (and fails) to create the volume.
-				if _, status, msg, ok := s.sizePreflight(dir, size); !ok {
-					http.Error(w, msg, status)
-					return
-				}
-				if err := docker.EnsureVolume(s.cfg.DockerRaw, name); err != nil {
-					http.Error(w, err.Error(), 500)
-					return
-				}
-			}
-		}
-	}
-
 	switch op {
-	case "up":
-		_, err = docker.Up(dir, s.cfg.Docker)
 	case "down":
 		_, err = docker.Down(dir, s.cfg.Docker)
 	case "restart":
@@ -590,6 +684,151 @@ func (s *server) serviceAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.Redirect(w, r, "/?msg="+op, http.StatusSeeOther)
+}
+
+// servicePrepareError wraps a failure of the launch-time prepare step (e.g.
+// cloudflared not logged in, mailcow missing hostname) so callers can surface
+// it as "user action needed" instead of a bare internal error.
+type servicePrepareError struct{ err error }
+
+func (e *servicePrepareError) Error() string { return e.err.Error() }
+
+func (e *servicePrepareError) Unwrap() error { return e.err }
+
+// upService starts a lifecycle-controlled service, capturing the steps the
+// action handler and AutoStart share: decrypt secrets, run the kind-specific
+// prepare step (materializing the config the compose mounts), write the
+// ephemeral .env, ensure the resizeable data volume, and `compose up -d
+// --force-recreate` so saved config edits are applied. mailcow's long first
+// start is delegated to the background job runner instead. Prepare failures
+// are wrapped as *servicePrepareError so callers can distinguish them; every
+// other failure is returned as-is.
+func (s *server) upService(id int64) error {
+	svc, err := s.cfg.DB.ServiceByID(id)
+	if err != nil {
+		return err
+	}
+	def, ok := services.Get(services.Kind(svc.Kind))
+	if !ok {
+		return fmt.Errorf("unknown kind %q", svc.Kind)
+	}
+	if def.ReadOnly {
+		return nil
+	}
+	if def.Kind == services.KindMailcow {
+		s.startMailcowUp(id)
+		return nil
+	}
+	dir := s.deployDir(id)
+	items, _ := s.cfg.DB.ConfigItems(id)
+	values, _, _ := decryptValues(s.cfg.Cipher, def, items, true)
+	s.injectVolumeName(dir, id, def.Kind, values)
+	if prep, ok := prepareFns[def.Kind]; ok {
+		if err := prep(s, dir, values); err != nil {
+			return &servicePrepareError{err}
+		}
+	}
+	if _, err := render.WriteEnvFile(dir, values); err != nil {
+		return err
+	}
+	defer render.RemoveEnvFile(dir)
+	if s.cfg.DockerRaw != nil {
+		if namedVolume, ok := resizeVolumeNames[def.Kind]; ok {
+			name := values["MINIO_VOLUME_NAME"]
+			if name == "" {
+				name = docker.VolumeName(dir, namedVolume)
+			}
+			size := values["MINIO_VOLUME_SIZE"]
+			if size == "" {
+				size = "100G"
+			}
+			// Reject a configured size the disk can't fit before Docker tries
+			// (and fails) to create the volume.
+			if _, _, msg, ok := s.sizePreflight(dir, size); !ok {
+				return fmt.Errorf("volume preflight: %s", msg)
+			}
+			if err := docker.EnsureVolume(s.cfg.DockerRaw, name); err != nil {
+				return err
+			}
+		}
+	}
+	_, err = docker.Up(dir, s.cfg.Docker)
+	return err
+}
+
+// AutoStart starts every service flagged "start on boot", in a background
+// goroutine per service, so an app restart (host reboot included) restores the
+// previously-running stack. Failures are logged per service so one broken
+// config can't take the rest down; the error also surfaces on the service page
+// the next time the operator touches it.
+func (s *server) AutoStart() {
+	svcs, err := s.cfg.DB.ListServices()
+	if err != nil {
+		log.Printf("autostart: list services: %v", err)
+		return
+	}
+	for _, svc := range svcs {
+		items, err := s.cfg.DB.ConfigItems(svc.ID)
+		if err != nil {
+			log.Printf("autostart %s (%s id=%d): read config: %v", svc.Name, svc.Kind, svc.ID, err)
+			continue
+		}
+		if strings.TrimSpace(items[autostartKey]) != "true" {
+			continue
+		}
+		svc := svc
+		go func() {
+			if err := s.upService(svc.ID); err != nil {
+				log.Printf("autostart %s (%s id=%d): %v", svc.Name, svc.Kind, svc.ID, err)
+			}
+		}()
+	}
+}
+
+// startMailcowUp launches a background goroutine that runs the (potentially
+// long) mailcow deployment: clone the upstream stack, then `compose up`, while
+// updating a per-service job so the UI can show live progress. It refuses to
+// start a second deployment while one is already in flight for the service.
+func (s *server) startMailcowUp(id int64) {
+	if s.jobs.active(id) {
+		return
+	}
+	s.jobs.set(id, JobCloning, "Cloning mailcow…", "")
+	go func() {
+		dir := s.deployDir(id)
+		def, _ := services.Get(services.KindMailcow)
+		items, _ := s.cfg.DB.ConfigItems(id)
+		values, _, _ := decryptValues(s.cfg.Cipher, def, items, true)
+
+		if err := prepareMailcow(s, dir, values); err != nil {
+			s.jobs.set(id, JobError, "", err.Error())
+			return
+		}
+		s.jobs.set(id, JobPulling, "Pulling images and starting the mail server…", "")
+		if _, err := docker.Up(dir, s.cfg.Docker); err != nil {
+			s.jobs.set(id, JobError, "", err.Error())
+			return
+		}
+		s.jobs.set(id, JobRunning, "Mailcow is running", "")
+	}()
+}
+
+// serviceStatus returns the background deployment job for a service (JSON) so
+// the UI can show live progress for long-running actions like the mailcow
+// first start. When no job exists a 204 is returned and the client stops
+// polling.
+func (s *server) serviceStatus(w http.ResponseWriter, r *http.Request) {
+	id := idFromPath(w, r)
+	if id == 0 {
+		return
+	}
+	j, ok := s.jobs.get(id)
+	if !ok {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprintf(w, `{"state":%q,"message":%q,"error":%q}`, j.state, j.msg, j.err)
 }
 
 // deleteService removes a service: it tears down any running containers,
@@ -637,8 +876,11 @@ func (s *server) deleteService(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Drop the deploy directory (compose file, ephemeral creds/config).
-	if err := os.RemoveAll(dir); err != nil {
+	// Drop the deploy directory (compose file, ephemeral creds/config). The
+	// directory may hold root-owned files created by docker compose mounts, so
+	// removal falls back to a disposable root container when the host-side
+	// delete hits a permission error.
+	if err := docker.RemoveDeployDir(dir, "", s.cfg.DockerRaw); err != nil {
 		http.Error(w, err.Error(), 500)
 		return
 	}
@@ -657,6 +899,11 @@ func (s *server) deleteService(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/?msg=deleted", http.StatusSeeOther)
 }
 
+// autostartKey is the universal config item flagging a service to be started
+// automatically when the app boots (see App.AutoStart). It is not a kind field:
+// every lifecycle-controlled service carries it.
+const autostartKey = "autostart"
+
 // resizeVolumeNames maps a service kind to the named volume (volume name in the
 // compose file) whose size may be resized. Only services that declare a
 // size-limited named volume are resizable; others return an error.
@@ -669,6 +916,7 @@ var resizeVolumeNames = map[services.Kind]string{
 // config.yml the compose mounts) to the step run right before `up`|`restart`.
 var prepareFns = map[services.Kind]func(s *server, dir string, values map[string]string) error{
 	services.KindCloudflared: prepareCloudflared,
+	services.KindMailcow:     prepareMailcow,
 }
 
 // prepareCloudflared resolves the tunnel for a cloudflared service at launch:
@@ -729,6 +977,254 @@ func prepareCloudflared(s *server, dir string, values map[string]string) error {
 		return err
 	}
 	return os.WriteFile(filepath.Join(dir, "config.yml"), []byte(cfg), 0o644)
+}
+
+// prepareMailcow materializes the mailcow checkout for a service at launch. On
+// first start it clones the official mailcow-dockerized repository into the
+// service's deploy dir (which then hosts the whole stack); subsequent starts
+// reuse the existing checkout. It reconciles the app-managed settings
+// (hostname, ports, TZ, stored credentials) into mailcow.conf — rendering it
+// on a fresh checkout, rewriting only its managed lines on an existing one —
+// and creates the `.env` -> `mailcow.conf` symlink mailcow's compose requires.
+// The official stack's own docker-compose.yml is what `up`/`down`/`restart`
+// act on; port-mapping edits apply when `up` recreates the containers.
+func prepareMailcow(s *server, dir string, values map[string]string) error {
+	if strings.TrimSpace(values["MAILCOW_HOSTNAME"]) == "" {
+		return fmt.Errorf("mail server hostname (FQDN) is required")
+	}
+	// Resolve (and, on first deploy, persist) the DB/Redis/API credentials
+	// BEFORE any file is written, so a freshly re-cloned checkout keeps the
+	// secrets its named Docker volumes were born with. Without this, a re-clone
+	// regenerates mailcow.conf with new secrets and the persisted MySQL datadir
+	// rejects them — php-fpm hangs on "Waiting for SQL..." and the entire
+	// mailcow UI goes dark behind nginx 502s.
+	if _, err := s.resolveMailcowSecrets(dir, values); err != nil {
+		return err
+	}
+	// The fully-active stack takes a long time on first start; give the clone
+	// and the eventual `up` generous time to complete.
+	if _, err := os.Stat(filepath.Join(dir, "docker-compose.yml")); os.IsNotExist(err) {
+		if err := os.MkdirAll(filepath.Dir(dir), 0o755); err != nil {
+			return err
+		}
+		// git clone requires an empty (or absent) target dir. Save never
+		// materializes files for mailcow, so dir is typically absent; guard
+		// against a stale empty dir by cloning into a temp sibling and renaming.
+		src := dir + "-src"
+		_ = os.RemoveAll(src)
+		cmd := exec.Command("git", "clone", "--depth", "1", services.MailcowRepo, src)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			_ = os.RemoveAll(src)
+			return fmt.Errorf("cloning mailcow failed (is git installed and the host online?): %w: %s", err, strings.TrimSpace(string(out)))
+		}
+		if err := os.Rename(src, dir); err != nil {
+			_ = os.RemoveAll(src)
+			return err
+		}
+	} else if err != nil {
+		return err
+	}
+
+	// Reconcile the app-managed settings into mailcow.conf. A fresh checkout
+	// has no conf, so MailcowConf renders one; an existing conf gets only its
+	// managed lines rewritten (operator tweaks survive), so saved edits to the
+	// hostname/ports/TZ propagate on the next launch — the stack's port
+	// mappings, which compose reads from this file, are what the nginx binds
+	// when `up` recreates the containers. Credentials come from the store, so
+	// reconciliation never rotates the secrets the volumes were initialized
+	// with; files whose managed lines already match are left untouched.
+	confPath := filepath.Join(dir, "mailcow.conf")
+	content, err := os.ReadFile(confPath)
+	existed := err == nil
+	if os.IsNotExist(err) {
+		content = []byte(services.MailcowConf(values))
+	} else if err != nil {
+		return err
+	}
+	updated := services.ReconcileMailcowConf(string(content), values)
+	if !existed || updated != string(content) {
+		if err := os.WriteFile(confPath, []byte(updated), 0o600); err != nil {
+			return err
+		}
+	}
+
+	// mailcow's compose reads its environment via a `.env` symlink to
+	// mailcow.conf. Recreate the symlink idempotently.
+	envLink := filepath.Join(dir, ".env")
+	if fi, err := os.Lstat(envLink); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+		// leave an existing valid symlink alone
+	} else {
+		if err := os.RemoveAll(envLink); err != nil {
+			return err
+		}
+		if err := os.Symlink("mailcow.conf", envLink); err != nil {
+			return err
+		}
+	}
+
+	// Apply environment-specific hardening idempotently (safe on fresh clones
+	// and on re-deploys alike): point mailcow's unbound DNS at working upstream
+	// forwarders instead of IPv6 root recursion, and seed the bundled TLS cert
+	// so nginx can boot on a cold start (e.g. when SKIP_LETS_ENCRYPT=y).
+	if err := hardenMailcow(dir); err != nil {
+		return err
+	}
+	return nil
+}
+
+// resolveMailcowSecrets loads the service's persisted mailcow credentials
+// (MySQL root/user, Redis, API key) from their encrypted config store,
+// generating and persisting a complete set on first deploy, and injects them
+// into values under the internal keys so MailcowConf reuses them. Doing this
+// against SQLite (not the checkout's mailcow.conf, which a re-clone destroys)
+// is what keeps the credentials aligned with the named Docker volumes the
+// stack mounts. When the store is incomplete but the checkout already carries a
+// mailcow.conf (a deploy created before credential persistence existed), the
+// credentials it contains are adopted rather than regenerated, since the
+// volumes were initialized with those. Corrupt/undecryptable stored
+// credentials are a hard error: the volumes are bound to whatever password they
+// were initialized with, so silently minting a fresh set would reproduce the
+// same drift this guards against.
+func (s *server) resolveMailcowSecrets(dir string, values map[string]string) (int64, error) {
+	// Deploy dirs are named after the service id, so the dir carries the id.
+	id, err := strconv.ParseInt(filepath.Base(dir), 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("mailcow deploy dir %q does not carry a service id", dir)
+	}
+	items, err := s.cfg.DB.ConfigItems(id)
+	if err != nil {
+		return id, err
+	}
+	existing := map[string]string{}
+	count := 0
+	for _, key := range services.MailcowSecretKeys() {
+		enc := items[key]
+		if enc == "" {
+			continue
+		}
+		plain, err := s.cfg.Cipher.Decrypt(enc)
+		if err != nil {
+			return id, fmt.Errorf("stored mailcow %s cannot be decrypted (%v): the service's MySQL/Redis/FPM volumes are bound to the credentials persisted on first deploy; restore the original master key, or delete this service and its mailcow volumes", key, err)
+		}
+		existing[key] = plain
+		count++
+	}
+	// Complete set present: reuse it. Otherwise adopt what the checkout's
+	// mailcow.conf already carries — a deploy created before credential
+	// persistence existed has a conf whose credentials the running volumes were
+	// initialized with, so minting fresh ones would reproduce exactly the drift
+	// this guard exists for — mint what's still missing, and persist the whole
+	// set so every later launch (a re-clone included) sees it.
+	if count != len(services.MailcowSecretKeys()) {
+		if conf, err := os.ReadFile(filepath.Join(dir, "mailcow.conf")); err == nil {
+			for key, confKey := range map[string]string{
+				services.MailcowSecretDBPass:    "DBPASS",
+				services.MailcowSecretDBRoot:    "DBROOT",
+				services.MailcowSecretRedisPass: "REDISPASS",
+				services.MailcowSecretAPIKey:    "API_KEY",
+			} {
+				if existing[key] != "" {
+					continue
+				}
+				if v := services.MailcowConfValue(string(conf), confKey); v != "" {
+					existing[key] = v
+				}
+			}
+		}
+		sec := services.MailcowSecrets(existing)
+		persist := make([]db.ConfigItem, 0, len(services.MailcowSecretKeys()))
+		for _, key := range services.MailcowSecretKeys() {
+			enc, err := s.cfg.Cipher.Encrypt(sec[key])
+			if err != nil {
+				return id, err
+			}
+			persist = append(persist, db.ConfigItem{Key: key, Value: enc})
+		}
+		if err := s.cfg.DB.SetConfigItems(id, persist); err != nil {
+			return id, err
+		}
+		for k, v := range sec {
+			values[k] = v
+		}
+		return id, nil
+	}
+	for k, v := range existing {
+		values[k] = v
+	}
+	return id, nil
+}
+
+// hardenMailcow applies idempotent, environment-safe tweaks to an existing
+// mailcow checkout so the stack reliably boots in constrained environments
+// (broken IPv6, no public cert yet). It only adds what is missing and never
+// overwrites a config the operator has already customized, so it is a no-op on
+// re-deploys and on checkouts that don't carry the referenced files.
+func hardenMailcow(dir string) error {
+	if err := hardenUnboundConf(dir); err != nil {
+		return err
+	}
+	return seedMailcowSelfSignedCert(dir)
+}
+
+// hardenUnboundConf makes mailcow's unbound resolve through working IPv4
+// forwarders rather than full root-server recursion over IPv6, which can fail
+// (and fail the whole stack's healthcheck) in sandboxed/virtualized hosts. It
+// edits data/conf/unbound/unbound.conf in place, adding nothing if the file is
+// absent or already hardened.
+func hardenUnboundConf(dir string) error {
+	p := filepath.Join(dir, "data", "conf", "unbound", "unbound.conf")
+	b, err := os.ReadFile(p)
+	if os.IsNotExist(err) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	conf := string(b)
+	if strings.Contains(conf, "forward-zone:") && strings.Contains(conf, "do-ip6: no") {
+		return nil // already hardened
+	}
+	if strings.Contains(conf, "do-ip6: yes") {
+		conf = strings.Replace(conf, "do-ip6: yes", "do-ip6: no", 1)
+	}
+	if !strings.Contains(conf, "forward-zone:") {
+		conf += "\nforward-zone:\n  name: \".\"\n  forward-addr: 1.1.1.1\n  forward-addr: 8.8.8.8\n"
+	}
+	return os.WriteFile(p, []byte(conf), 0o644)
+}
+
+// seedMailcowSelfSignedCert copies mailcow's bundled example TLS certificate
+// (cert.pem/key.pem/dhparams.pem) from data/assets/ssl-example into
+// data/assets/ssl when none is present. mailcow's compose mounts the ssl dir
+// read-only at /etc/ssl/mail and nginx refuses to start without a cert.mailcow
+// normally seeds this on boot, but skips it when SKIP_LETS_ENCRYPT=y; doing it
+// at launch (before docker mounts the dir) also keeps the directory owned by
+// the app user so reruns are idempotent. Existing certificates are left alone.
+func seedMailcowSelfSignedCert(dir string) error {
+	ssl := filepath.Join(dir, "data", "assets", "ssl")
+	if _, err := os.Stat(filepath.Join(ssl, "cert.pem")); err == nil {
+		return nil // a certificate is already present
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	example := filepath.Join(dir, "data", "assets", "ssl-example")
+	for _, name := range []string{"cert.pem", "key.pem", "dhparams.pem"} {
+		if _, err := os.Stat(filepath.Join(example, name)); os.IsNotExist(err) {
+			continue // example file not shipped; nothing to seed
+		} else if err != nil {
+			return err
+		}
+		if err := os.MkdirAll(ssl, 0o755); err != nil {
+			return err
+		}
+		data, err := os.ReadFile(filepath.Join(example, name))
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(filepath.Join(ssl, name), data, 0o600); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // injectVolumeName adds the MINIO_VOLUME_NAME the compose should mount to
@@ -900,9 +1396,6 @@ func (s *server) deployDir(id int64) string {
 }
 
 func (s *server) statusDir(svc db.Service) string {
-	if def, ok := services.Get(services.Kind(svc.Kind)); ok && def.ReadOnly {
-		return s.cfg.MailcowDir
-	}
 	return s.deployDir(svc.ID)
 }
 

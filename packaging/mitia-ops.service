@@ -1,0 +1,18 @@
+[Unit]
+Description=mitia-ops - single-binary dashboard for self-hosted services
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/var/lib/mitia-ops
+EnvironmentFile=/etc/mitia-ops/env
+ExecStart=/usr/local/bin/mitia-ops
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -5,7 +5,7 @@
     <p class="hint">Name: <strong>{{ .Service.Name }}</strong> &middot; ID: <span class="mono">{{ .Service.ID }}</span></p>
   </div>
   <div class="actions">
-    {{ if and .Def.ReadOnly .ConfigURL }}
+    {{ if .ConfigURL }}
     <a class="btn" href="{{ .ConfigURL }}" target="_blank" rel="noopener">Open config</a>
     {{ end }}
     <a href="/" class="btn muted">← Services</a>
@@ -17,6 +17,12 @@
 </div>
 
 {{ if .Msg }}<div class="flash{{ if .MsgError }} error{{ end }}" role="status">{{ if .MsgError }}⚠ {{ else }}✓ {{ end }}{{ linkify .Msg }}</div>{{ end }}
+
+{{ if or (eq .JobState "cloning") (eq .JobState "pulling") }}
+<div class="flash" role="status" id="deployBanner" data-job-id="{{ .Service.ID }}" data-job-state="{{ .JobState }}" data-job-msg="{{ .JobMsg }}">
+  Deploying {{ .Def.Label }}: {{ .JobMsg }} &hellip;
+</div>
+{{ end }}
 
 <form method="post" action="/service/{{ .Service.ID }}" id="svcForm">
 
@@ -44,6 +50,11 @@
       {{ end }}
       {{ end }}
       {{ end }}
+      <div class="check-row">
+        <input type="checkbox" id="autostart" name="autostart" {{ if .Autostart }}checked{{ end }}>
+        <label for="autostart">Start on boot</label>
+      </div>
+      <p class="hint" style="margin-top:.25rem">Bring this service up automatically when the app starts &mdash; e.g. after the host reboots.</p>
     </fieldset>
   </div>
 
@@ -118,6 +129,34 @@
   var form = document.getElementById('svcForm');
   var btn = document.getElementById('saveBtn');
   var resizeRow = document.querySelector('[data-resize]');
+
+  // Live progress for long background deployments (mailcow first start).
+  var banner = document.getElementById('deployBanner');
+  if (banner) {
+    var bid = banner.dataset.jobId;
+    var timer = setInterval(function () {
+      fetch('/service/' + bid + '/status')
+        .then(function (res) {
+          if (res.status === 204) { clearInterval(timer); window.location.reload(); return null; }
+          return res.json();
+        })
+        .then(function (j) {
+          if (!j) return;
+          if (j.state === 'cloning' || j.state === 'pulling') {
+            banner.innerHTML = 'Deploying: ' + (j.message || '') + ' &hellip;';
+          } else if (j.state === 'error') {
+            clearInterval(timer);
+            banner.className = 'flash error';
+            banner.innerHTML = '⚠ Deployment failed: <span class="mono">' + (j.error || '') + '</span>';
+          } else if (j.state === 'running') {
+            clearInterval(timer);
+            banner.innerHTML = 'Mailcow is running';
+            setTimeout(function () { window.location.reload(); }, 800);
+          }
+        })
+        .catch(function () { clearInterval(timer); });
+    }, 1000);
+  }
 
   form.addEventListener('submit', function () {
     // Resize confirmation only applies when a size is already configured; a

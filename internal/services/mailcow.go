@@ -1,20 +1,53 @@
 package services
 
+import (
+	"crypto/rand"
+	"math/big"
+	"strings"
+)
+
+// MailcowRepo is the official upstream repository that mitia-ops clones to
+// obtain mailcow's own docker-compose stack. The app drives lifecycle through
+// the official stack rather than re-authoring it.
+const MailcowRepo = "https://github.com/mailcow/mailcow-dockerized.git"
+
 func init() {
 	register(Definition{
-		Kind:     KindMailcow,
-		Label:    "Mailcow (mail server)",
-		ReadOnly: true,
+		Kind:  KindMailcow,
+		Label: "Mailcow (mail server)",
 		Fields: []Field{
+			{
+				Key:         "MAILCOW_HOSTNAME",
+				Label:       "Mail server hostname (FQDN)",
+				Type:        FieldString,
+				Placeholder: "mail.example.com",
+				Hints:       "your mail server's hostname, not your mail domain",
+			},
 			{
 				Key:         "MAILCOW_HTTP_PORT",
 				Label:       "HTTP port",
 				Type:        FieldString,
-				Placeholder: "8080",
-				Hints:       "public port; config URL is http://localhost:<port>",
+				Placeholder: "80",
+				Hints:       "public port for the mailcow web UI",
+			},
+			{
+				Key:         "MAILCOW_HTTPS_PORT",
+				Label:       "HTTPS port",
+				Type:        FieldString,
+				Placeholder: "443",
+				Hints:       "public port for HTTPS access",
+			},
+			{
+				Key:         "MAILCOW_TZ",
+				Label:       "Timezone",
+				Type:        FieldString,
+				Placeholder: "Europe/Madrid",
 			},
 		},
 		Render: func(values map[string]string) (RenderResult, error) {
+			// mailcow runs its own upstream docker-compose stack; the app renders
+			// no compose or dotenv here. All configuration happens at launch via
+			// mailcow.conf written into the cloned checkout (see MailcowPrepare).
 			return RenderResult{}, nil
 		},
 		ConfigURL: func(values map[string]string) string {
@@ -24,4 +57,205 @@ func init() {
 			return ""
 		},
 	})
+}
+
+// Internal config-item keys under which the app persists mailcow's generated
+// credentials (DB/Redis/API), encrypted in SQLite. They survive a re-clone of
+// the checkout whose mailcow.conf is regenerated, so the credentials stay in
+// sync with the service's named Docker volumes. They are not user fields (the
+// form only ever emits MAILCOW_* keys) and live in config_items alongside the
+// app-managed values (e.g. MINIO_VOLUME_NAME).
+const (
+	MailcowSecretDBPass    = "mailcow.dbpass"
+	MailcowSecretDBRoot    = "mailcow.dbroot"
+	MailcowSecretRedisPass = "mailcow.redispass"
+	MailcowSecretAPIKey    = "mailcow.apikey"
+)
+
+// MailcowSecretKeys returns the config-item keys carrying mailcow's stored
+// credentials, in the order MailcowConf emits them.
+func MailcowSecretKeys() []string {
+	return []string{MailcowSecretDBPass, MailcowSecretDBRoot, MailcowSecretRedisPass, MailcowSecretAPIKey}
+}
+
+// MailcowSecrets returns the DB/Redis/API credentials for a mailcow.conf. Values
+// already present under the internal MailcowSecret* keys are reused verbatim;
+// anything missing is freshly generated. Reusing stored values keeps the
+// credentials stable for the life of the service's data volumes — a re-cloned
+// checkout must not rotate the DB password underneath a still-mounted MySQL
+// datadir (that drift hangs php-fpm on "Waiting for SQL..." and takes the whole
+// mailcow UI down).
+func MailcowSecrets(values map[string]string) map[string]string {
+	return map[string]string{
+		MailcowSecretDBPass:    firstNonEmpty(values[MailcowSecretDBPass], randomAlnum(28)),
+		MailcowSecretDBRoot:    firstNonEmpty(values[MailcowSecretDBRoot], randomAlnum(28)),
+		MailcowSecretRedisPass: firstNonEmpty(values[MailcowSecretRedisPass], randomAlnum(28)),
+		MailcowSecretAPIKey:    firstNonEmpty(values[MailcowSecretAPIKey], randomAlnum(32)),
+	}
+}
+
+// MailcowConf renders a mailcow.conf file for the given values, generating
+// fresh random secrets for the DB, Redis, and API unless the caller already
+// carries stable credentials under the internal MailcowSecret* keys (see
+// MailcowSecrets). Fresh files are written by the launch prepare step; existing
+// files are reconciled in place (see ReconcileMailcowConf) so saved edits to
+// the app-managed fields apply without ever clobbering operator tweaks or
+// rotating the credentials the mounted volumes were born with.
+func MailcowConf(values map[string]string) string {
+	v := mailcowConfValues(values)
+	// Rendered layout (blank lines between groups) matches mailcow's own
+	// generate_config.sh output shape; mailcow's compose only reads this as
+	// `KEY=value` lines, but keeping the grouping stable makes diffs friendly.
+	order := []string{
+		"MAILCOW_HOSTNAME", "MAILCOW_PASS_SCHEME", "",
+		"DBNAME", "DBUSER", "DBPASS", "DBROOT", "",
+		"REDISPASS", "",
+		"HTTP_PORT", "HTTP_BIND", "",
+		"HTTPS_PORT", "HTTPS_BIND", "HTTP_REDIRECT", "",
+		"API_KEY", "API_KEY_READ_ONLY", "API_ALLOW_FROM", "",
+		"SKIP_LETS_ENCRYPT", "SKIP_SOGO", "SKIP_CLAMD", "",
+		"TZ",
+	}
+	lines := make([]string, 0, len(order))
+	for _, key := range order {
+		if key == "" {
+			lines = append(lines, "")
+			continue
+		}
+		lines = append(lines, key+"="+v[key])
+	}
+	return `# Source for this config: https://github.com/mailcow/mailcow-dockerized
+# Generated by mitia-ops; do not edit unless you know what you are doing.
+` + strings.Join(lines, "\n") + "\n"
+}
+
+// mailcowConfOrder lists the app-managed mailcow.conf keys in the order
+// MailcowConf renders them. ReconcileMailcowConf appends keys a file is missing
+// in the same order.
+var mailcowConfOrder = []string{
+	"MAILCOW_HOSTNAME",
+	"MAILCOW_PASS_SCHEME",
+	"DBNAME",
+	"DBUSER",
+	"DBPASS",
+	"DBROOT",
+	"REDISPASS",
+	"HTTP_PORT",
+	"HTTP_BIND",
+	"HTTPS_PORT",
+	"HTTPS_BIND",
+	"HTTP_REDIRECT",
+	"API_KEY",
+	"API_KEY_READ_ONLY",
+	"API_ALLOW_FROM",
+	"SKIP_LETS_ENCRYPT",
+	"SKIP_SOGO",
+	"SKIP_CLAMD",
+	"TZ",
+}
+
+// mailcowConfManaged reports whether key is owned by the app (rendered by
+// MailcowConf and reconciled by ReconcileMailcowConf). Lines mailcow's own
+// generate_config.sh emits beyond these are operator territory.
+var mailcowConfManaged = func() map[string]bool {
+	m := make(map[string]bool, len(mailcowConfOrder))
+	for _, k := range mailcowConfOrder {
+		m[k] = true
+	}
+	return m
+}()
+
+// mailcowConfValues maps each app-managed mailcow.conf key to its canonical
+// current value for the given user fields and persisted credentials. It is the
+// single source of truth shared by MailcowConf (fresh files) and
+// ReconcileMailcowConf (existing files), so both always agree.
+func mailcowConfValues(values map[string]string) map[string]string {
+	sec := MailcowSecrets(values)
+	return map[string]string{
+		"MAILCOW_HOSTNAME":    strings.TrimSpace(values["MAILCOW_HOSTNAME"]),
+		"MAILCOW_PASS_SCHEME": "BLF-CRYPT",
+		"DBNAME":              "mailcow",
+		"DBUSER":              "mailcow",
+		"DBPASS":              sec[MailcowSecretDBPass],
+		"DBROOT":              sec[MailcowSecretDBRoot],
+		"REDISPASS":           sec[MailcowSecretRedisPass],
+		"HTTP_PORT":           firstNonEmpty(values["MAILCOW_HTTP_PORT"], "80"),
+		"HTTP_BIND":           "",
+		"HTTPS_PORT":          firstNonEmpty(values["MAILCOW_HTTPS_PORT"], "443"),
+		"HTTPS_BIND":          "",
+		"HTTP_REDIRECT":       "y",
+		"API_KEY":             sec[MailcowSecretAPIKey],
+		"API_KEY_READ_ONLY":   "invalid",
+		"API_ALLOW_FROM":      "invalid",
+		"SKIP_LETS_ENCRYPT":   "y",
+		"SKIP_SOGO":           "n",
+		"SKIP_CLAMD":          "y",
+		"TZ":                  firstNonEmpty(values["MAILCOW_TZ"], "Etc/UTC"),
+	}
+}
+
+// MailcowConfValue returns the bare value of key in a mailcow.conf body, or ""
+// when the key is absent.
+func MailcowConfValue(conf, key string) string {
+	for _, line := range strings.Split(conf, "\n") {
+		line = strings.TrimSuffix(line, "\r")
+		if v, ok := strings.CutPrefix(line, key+"="); ok {
+			return v
+		}
+	}
+	return ""
+}
+
+// ReconcileMailcowConf applies the app-managed settings to an existing
+// mailcow.conf, replacing the managed `KEY=value` lines in place and appending
+// any managed keys the file is missing (in MailcowConf's render order). Every
+// other line — operator tweaks not managed by the app, like ADDITIONAL_SAN or
+// custom limits — is preserved byte-for-byte, so reconciliation never clobbers
+// hand-edits to the file. Credentials come from the store (see MailcowSecrets),
+// so reconciling never rotates secrets out from under the mounted volumes.
+func ReconcileMailcowConf(conf string, values map[string]string) string {
+	want := mailcowConfValues(values)
+	lines := strings.Split(conf, "\n")
+	seen := make(map[string]bool, len(mailcowConfOrder))
+	for i, line := range lines {
+		key, _, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		key = strings.TrimSpace(key)
+		if !mailcowConfManaged[key] {
+			continue
+		}
+		lines[i] = key + "=" + want[key]
+		seen[key] = true
+	}
+	for _, key := range mailcowConfOrder {
+		if !seen[key] {
+			lines = append(lines, key+"="+want[key])
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+func firstNonEmpty(v, def string) string {
+	if strings.TrimSpace(v) != "" {
+		return strings.TrimSpace(v)
+	}
+	return def
+}
+
+// randomAlnum returns a cryptographically-random alphanumeric string of length
+// n (same alphabet mailcow's generate_config.sh uses for its secrets).
+func randomAlnum(n int) string {
+	const alpha = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+	b := make([]byte, n)
+	for i := range b {
+		r, err := rand.Int(rand.Reader, big.NewInt(int64(len(alpha))))
+		if err != nil {
+			b[i] = alpha[0]
+			continue
+		}
+		b[i] = alpha[r.Int64()]
+	}
+	return string(b)
 }

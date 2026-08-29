@@ -103,7 +103,7 @@ func TestWriteEnvFileAndRemove(t *testing.T) {
 	}
 }
 
-func TestBuildRenderResultEmptyForReadOnlyMailcow(t *testing.T) {
+func TestBuildRenderResultEmptyForMailcow(t *testing.T) {
 	res, err := BuildRenderResult(services.KindMailcow, map[string]string{"MAILCOW_HTTP_PORT": "8080"})
 	if err != nil {
 		t.Fatal(err)

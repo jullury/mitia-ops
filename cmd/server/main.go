@@ -94,15 +94,17 @@ func main() {
 	if err := cf.EnsureHome(); err != nil {
 		log.Fatal(err)
 	}
-	mux := web.New(web.Config{
+	app := web.New(web.Config{
 		DB:          d,
 		Cipher:      cipher,
 		DeployDir:   deployDir,
-		MailcowDir:  dataDir + "/mailcow",
 		Docker:      cli,
 		DockerRaw:   cli,
 		Cloudflared: cf,
 	})
+	// Bring back every service flagged "start on boot" (runs `up` per service in
+	// the background), so an app restart / host reboot restores the stack.
+	app.AutoStart()
 	log.Printf("mitia-ops listening on %s", addr)
-	log.Fatal(http.ListenAndServe(addr, mux))
+	log.Fatal(http.ListenAndServe(addr, app))
 }

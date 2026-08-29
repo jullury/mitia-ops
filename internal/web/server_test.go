@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/jullury/mitia-ops/internal/crypto"
 	"github.com/jullury/mitia-ops/internal/db"
@@ -53,11 +54,10 @@ func testServer(t *testing.T) (*db.DB, http.Handler) {
 	t.Cleanup(func() { d.Close() })
 	c, _ := crypto.New("master")
 	cfg := Config{
-		DB:         d,
-		Cipher:     c,
-		DeployDir:  t.TempDir(),
-		MailcowDir: t.TempDir(),
-		Docker:     &fakeRunner{},
+		DB:        d,
+		Cipher:    c,
+		DeployDir: t.TempDir(),
+		Docker:    &fakeRunner{},
 	}
 	return d, New(cfg)
 }
@@ -207,7 +207,34 @@ func TestUpActionRemovesEphemeralEnv(t *testing.T) {
 	}
 }
 
-func TestMailcowLifecycleRejected(t *testing.T) {
+// seedMailcow service account: create a mailcow service with a saved hostname
+// and a deploy dir that already contains an upstream docker-compose.yml, so the
+// launch prepare step reuses the checkout instead of cloning (which needs git
+// + network). Returns the service id and the deploy dir.
+func seedMailcow(t *testing.T, d *db.DB, deployDir string) int64 {
+	t.Helper()
+	id, err := d.CreateService("mailcow", "mail")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(deployDir, itoa(id))
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "docker-compose.yml"), []byte("services: {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	items := []db.ConfigItem{
+		{Key: "MAILCOW_HOSTNAME", Value: "mail.example.com"},
+		{Key: "MAILCOW_HTTP_PORT", Value: "8080"},
+	}
+	if err := d.SetConfigItems(id, items); err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+func TestMailcowLifecycleRunsCompose(t *testing.T) {
 	dbDir := filepath.Join(t.TempDir(), "test.db")
 	d, err := db.Open(dbDir)
 	if err != nil {
@@ -217,30 +244,98 @@ func TestMailcowLifecycleRejected(t *testing.T) {
 	c, _ := crypto.New("master")
 	deployDir := t.TempDir()
 	runner := &fakeRunner{}
-	h := New(Config{DB: d, Cipher: c, DeployDir: deployDir, MailcowDir: t.TempDir(), Docker: runner})
+	h := New(Config{DB: d, Cipher: c, DeployDir: deployDir, Docker: runner})
 
-	id, err := d.CreateService("mailcow", "mail")
-	if err != nil {
-		t.Fatal(err)
+	id := seedMailcow(t, d, deployDir)
+	dir := filepath.Join(deployDir, itoa(id))
+
+	// Wait for a command to appear in the fake runner, or time out. The mailcow
+	// `up` runs in a background goroutine (so the browser can show progress
+	// during the long clone/pull), so it is not recorded synchronously.
+	waitFor := func(expect string) []string {
+		t.Helper()
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			got := runner.recorded()
+			for _, g := range got {
+				if g == expect {
+					return got
+				}
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		t.Fatalf("async step %q never ran, recorded %v", expect, runner.recorded())
+		return nil
 	}
-	for _, op := range []string{"up", "down", "restart"} {
-		req := httptest.NewRequest("POST", "/service/"+itoa(id)+"/action?op="+op, nil)
-		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, req)
-		if rec.Code != http.StatusBadRequest {
-			t.Fatalf("mailcow %s must be rejected with 400, got %d", op, rec.Code)
-		}
-		if got := runner.recorded(); len(got) != 0 {
-			t.Fatalf("mailcow %s must be rejected before any docker command runs, got %v", op, got)
-		}
-		envPath := filepath.Join(deployDir, itoa(id), ".env")
-		if _, err := os.Stat(envPath); !os.IsNotExist(err) {
-			t.Fatalf("mailcow %s must be rejected before a temp .env is written (at %s)", op, envPath)
-		}
+
+	// `up` is asynchronous: the handler redirects immediately and the compose
+	// run happens in the background.
+	req := httptest.NewRequest("POST", "/service/"+itoa(id)+"/action?op=up", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("mailcow up status %d (body %s)", rec.Code, rec.Body.String())
+	}
+	waitFor("compose up -d --force-recreate")
+
+	// `restart` runs synchronously and immediately recorded.
+	before := len(runner.recorded())
+	req = httptest.NewRequest("POST", "/service/"+itoa(id)+"/action?op=restart", nil)
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("mailcow restart status %d (body %s)", rec.Code, rec.Body.String())
+	}
+	got := runner.recorded()[before:]
+	if len(got) != 1 || got[0] != "compose restart" {
+		t.Fatalf("mailcow restart must run exactly %q this step, got %v", "compose restart", got)
+	}
+
+	// `down` runs synchronously and immediately recorded.
+	before = len(runner.recorded())
+	req = httptest.NewRequest("POST", "/service/"+itoa(id)+"/action?op=down", nil)
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("mailcow down status %d (body %s)", rec.Code, rec.Body.String())
+	}
+	got = runner.recorded()[before:]
+	if len(got) != 1 || got[0] != "compose down" {
+		t.Fatalf("mailcow down must run exactly %q this step, got %v", "compose down", got)
+	}
+
+	// The prepare step must have written mailcow.conf and the .env symlink.
+	if _, err := os.Stat(filepath.Join(dir, "mailcow.conf")); err != nil {
+		t.Fatalf("mailcow.conf should be written, got %v", err)
+	}
+	if fi, err := os.Lstat(filepath.Join(dir, ".env")); err != nil || fi.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf(".env should be a symlink to mailcow.conf, got %v %v", fi, err)
 	}
 }
 
-func TestSaveReadOnlyServiceDoesNotCreateDeployDir(t *testing.T) {
+// mailcowConfValue extracts the value of a `key=` line from the written
+// mailcow.conf; a helper for the tests only.
+func mailcowConfValue(t *testing.T, dir, key string) string {
+	t.Helper()
+	conf, err := os.ReadFile(filepath.Join(dir, "mailcow.conf"))
+	if err != nil {
+		t.Fatalf("read mailcow.conf: %v", err)
+	}
+	for _, line := range strings.Split(string(conf), "\n") {
+		if v, ok := strings.CutPrefix(strings.TrimSuffix(line, "\r"), key+"="); ok {
+			return v
+		}
+	}
+	t.Fatalf("mailcow.conf missing %s:\n%s", key, conf)
+	return ""
+}
+
+// TestMailcowRecloneKeepsCredentials reproduces the credential-drift bug: the
+// deploy dir (and with it mailcow.conf) is re-created while the named Docker
+// volumes survive. The first `up` must persist its generated DB/Redis/API
+// credentials (encrypted) so the re-clone's conf reuses them instead of
+// rotating secrets under the still-mounted MySQL datadir.
+func TestMailcowRecloneKeepsCredentials(t *testing.T) {
 	dbDir := filepath.Join(t.TempDir(), "test.db")
 	d, err := db.Open(dbDir)
 	if err != nil {
@@ -249,7 +344,358 @@ func TestSaveReadOnlyServiceDoesNotCreateDeployDir(t *testing.T) {
 	t.Cleanup(func() { d.Close() })
 	c, _ := crypto.New("master")
 	deployDir := t.TempDir()
-	h := New(Config{DB: d, Cipher: c, DeployDir: deployDir, MailcowDir: t.TempDir(), Docker: &fakeRunner{}})
+	runner := &fakeRunner{}
+	h := New(Config{DB: d, Cipher: c, DeployDir: deployDir, Docker: runner})
+
+	id := seedMailcow(t, d, deployDir)
+	dir := filepath.Join(deployDir, itoa(id))
+
+	// up runs the async mailcow flow; return once a new compose command lands
+	// in the fake runner (the conf/prepare step runs before it, so by then the
+	// file is written).
+	up := func(prior int) {
+		t.Helper()
+		req := httptest.NewRequest("POST", "/service/"+itoa(id)+"/action?op=up", nil)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusSeeOther {
+			t.Fatalf("up status %d (body %s)", rec.Code, rec.Body.String())
+		}
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			if len(runner.recorded()) > prior {
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		t.Fatalf("async up never ran (recorded %d before, %v now)", prior, runner.recorded())
+	}
+
+	up(0)
+	first := map[string]string{
+		"DBPASS":    mailcowConfValue(t, dir, "DBPASS"),
+		"DBROOT":    mailcowConfValue(t, dir, "DBROOT"),
+		"REDISPASS": mailcowConfValue(t, dir, "REDISPASS"),
+		"API_KEY":   mailcowConfValue(t, dir, "API_KEY"),
+	}
+
+	// Credentials must be persisted (encrypted) so a re-clone can restore them.
+	stored := map[string]string{
+		"DBPASS":    "mailcow.dbpass",
+		"DBROOT":    "mailcow.dbroot",
+		"REDISPASS": "mailcow.redispass",
+		"API_KEY":   "mailcow.apikey",
+	}
+	items, _ := d.ConfigItems(id)
+	for confKey, itemKey := range stored {
+		enc := items[itemKey]
+		if enc == "" {
+			t.Fatalf("first up must persist credentials under %q", itemKey)
+		}
+		if got, err := c.Decrypt(enc); err != nil || got != first[confKey] {
+			t.Fatalf("stored %q must decrypt to the generated %s (err %v, got %q)",
+				itemKey, confKey, err, got)
+		}
+	}
+
+	// Simulate an out-of-band re-clone: the checkout (and mailcow.conf) is
+	// gone; only the Docker named volumes survive.
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "docker-compose.yml"), []byte("services: {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	up(1)
+	for _, k := range []string{"DBPASS", "DBROOT", "REDISPASS", "API_KEY"} {
+		if got := mailcowConfValue(t, dir, k); got != first[k] {
+			t.Fatalf("re-clone rotated %s: first %q, regenerated %q", k, first[k], got)
+		}
+	}
+}
+
+// TestMailcowSavedPortPropagatesToConf guards the "port config is not picked
+// up" bug: after the operator saves a new HTTP port, the NEXT launch must
+// re-render mailcow.conf (the file compose reads for port mappings) with the
+// new port — without rotating the DB/API credentials the volumes were
+// initialized with.
+func TestMailcowSavedPortPropagatesToConf(t *testing.T) {
+	dbDir := filepath.Join(t.TempDir(), "test.db")
+	d, err := db.Open(dbDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { d.Close() })
+	c, _ := crypto.New("master")
+	deployDir := t.TempDir()
+	runner := &fakeRunner{}
+	h := New(Config{DB: d, Cipher: c, DeployDir: deployDir, Docker: runner})
+
+	id := seedMailcow(t, d, deployDir) // MAILCOW_HTTP_PORT=8080
+	dir := filepath.Join(deployDir, itoa(id))
+
+	// up runs the async mailcow flow; return once a new compose command lands
+	// in the fake runner (the conf/prepare step runs before it, so by then the
+	// file is written).
+	up := func(prior int) {
+		t.Helper()
+		req := httptest.NewRequest("POST", "/service/"+itoa(id)+"/action?op=up", nil)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusSeeOther {
+			t.Fatalf("up status %d (body %s)", rec.Code, rec.Body.String())
+		}
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			if len(runner.recorded()) > prior {
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		t.Fatalf("async up never ran (recorded %d before, %v now)", prior, runner.recorded())
+	}
+
+	up(0)
+	first := map[string]string{
+		"DBPASS":    mailcowConfValue(t, dir, "DBPASS"),
+		"DBROOT":    mailcowConfValue(t, dir, "DBROOT"),
+		"REDISPASS": mailcowConfValue(t, dir, "REDISPASS"),
+		"API_KEY":   mailcowConfValue(t, dir, "API_KEY"),
+	}
+	if v := mailcowConfValue(t, dir, "HTTP_PORT"); v != "8080" {
+		t.Fatalf("first launch must render HTTP_PORT=8080, got %q", v)
+	}
+
+	// The operator edits the port and saves. mailcow renders nothing on save
+	// (config is materialized at launch), so only the stored value changes.
+	form := url.Values{"MAILCOW_HOSTNAME": {"mail.example.com"}, "MAILCOW_HTTP_PORT": {"2111"}}
+	req := httptest.NewRequest("POST", "/service/"+itoa(id), strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("save status %d (body %s)", rec.Code, rec.Body.String())
+	}
+
+	// The next launch must apply the saved edit to mailcow.conf.
+	up(1)
+	if v := mailcowConfValue(t, dir, "HTTP_PORT"); v != "2111" {
+		t.Fatalf("saved port must propagate to mailcow.conf on the next launch: want 2111, conf has %q", v)
+	}
+	for _, k := range []string{"DBPASS", "DBROOT", "REDISPASS", "API_KEY"} {
+		if got := mailcowConfValue(t, dir, k); got != first[k] {
+			t.Fatalf("port edit rotated %s: first %q, now %q", k, first[k], got)
+		}
+	}
+}
+
+// TestMailcowAdoptsExistingConfSecrets covers the upgrade path of this fix: a
+// checkout whose mailcow.conf already carries credentials, but whose encrypted
+// store is empty (as created before credential persistence existed), must adopt
+// those credentials into the store instead of minting fresh ones — otherwise
+// the next launch rotates secrets underneath the still-mounted MySQL datadir.
+func TestMailcowAdoptsExistingConfSecrets(t *testing.T) {
+	d, err := db.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { d.Close() })
+	c, _ := crypto.New("master")
+	deployDir := t.TempDir()
+	id := seedMailcow(t, d, deployDir) // MAILCOW_HTTP_PORT=8080, store empty
+	dir := filepath.Join(deployDir, itoa(id))
+
+	seed := "MAILCOW_HOSTNAME=mail.example.com\n" +
+		"DBPASS=legacy-db-pass\nDBROOT=legacy-db-root\nREDISPASS=legacy-redis-pass\n" +
+		"API_KEY=legacy-api-key\nHTTP_PORT=9443\n"
+	if err := os.WriteFile(filepath.Join(dir, "mailcow.conf"), []byte(seed), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	s := &server{cfg: Config{DB: d, Cipher: c, DeployDir: deployDir}}
+	if err := prepareMailcow(s, dir, map[string]string{
+		"MAILCOW_HOSTNAME":  "mail.example.com",
+		"MAILCOW_HTTP_PORT": "8080",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The conf's credentials must have been adopted into the encrypted store.
+	legacy := map[string]string{
+		"mailcow.dbpass":    "legacy-db-pass",
+		"mailcow.dbroot":    "legacy-db-root",
+		"mailcow.redispass": "legacy-redis-pass",
+		"mailcow.apikey":    "legacy-api-key",
+	}
+	items, _ := d.ConfigItems(id)
+	for itemKey, want := range legacy {
+		enc := items[itemKey]
+		if enc == "" {
+			t.Fatalf("launch must persist adopted credential under %q", itemKey)
+		}
+		if got, err := c.Decrypt(enc); err != nil || got != want {
+			t.Fatalf("adopted %q must decrypt to %q (err %v, got %q)", itemKey, want, err, got)
+		}
+	}
+
+	// The launched conf must reuse them verbatim (no rotation) while still
+	// applying saved edits: HTTP_PORT was 9443 in the file, 8080 in the store.
+	conf, err := os.ReadFile(filepath.Join(dir, "mailcow.conf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"DBPASS=legacy-db-pass", "DBROOT=legacy-db-root",
+		"REDISPASS=legacy-redis-pass", "API_KEY=legacy-api-key", "HTTP_PORT=8080",
+	} {
+		if !strings.Contains(string(conf), want) {
+			t.Fatalf("mailcow.conf missing %q after adoption:\n%s", want, conf)
+		}
+	}
+}
+
+// TestMailcowStoredSecretCorruptionErrors guards the failure mode where the
+// stored credential set can no longer be decrypted (e.g. the master key was
+// rotated): the launch must abort loudly instead of silently rotating secrets
+// underneath the mounted data volumes.
+func TestMailcowStoredSecretCorruptionErrors(t *testing.T) {
+	d, err := db.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { d.Close() })
+	c, _ := crypto.New("master")
+	deployDir := t.TempDir()
+	id := seedMailcow(t, d, deployDir)
+
+	if err := d.SetConfigItems(id, []db.ConfigItem{
+		{Key: "mailcow.dbpass", Value: "garbage-not-ciphertext"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	s := &server{cfg: Config{DB: d, Cipher: c, DeployDir: deployDir}}
+	err = prepareMailcow(s, filepath.Join(deployDir, itoa(id)), map[string]string{"MAILCOW_HOSTNAME": "mail.example.com"})
+	if err == nil {
+		t.Fatal("undecryptable stored credentials must abort the launch, got nil")
+	}
+	if !strings.Contains(err.Error(), "mailcow.dbpass") {
+		t.Fatalf("error should name the undecryptable key, got: %v", err)
+	}
+}
+
+func TestMailcowUpRequiresHostname(t *testing.T) {
+	dbDir := filepath.Join(t.TempDir(), "test.db")
+	d, err := db.Open(dbDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { d.Close() })
+	c, _ := crypto.New("master")
+	deployDir := t.TempDir()
+	runner := &fakeRunner{}
+	h := New(Config{DB: d, Cipher: c, DeployDir: deployDir, Docker: runner})
+
+	id, err := d.CreateService("mailcow", "mail")
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest("POST", "/service/"+itoa(id)+"/action?op=up", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("status %d", rec.Code)
+	}
+	if got := runner.recorded(); len(got) != 0 {
+		t.Fatalf("mailcow up without a hostname must not run docker, got %v", got)
+	}
+}
+
+// TestMailcowStatusEndpointLiveProgress verifies that the async mailcow `up`
+// exposes its progress through the JSON status endpoint, ending in `running`.
+func TestMailcowStatusEndpointLiveProgress(t *testing.T) {
+	dbDir := filepath.Join(t.TempDir(), "test.db")
+	d, err := db.Open(dbDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { d.Close() })
+	c, _ := crypto.New("master")
+	deployDir := t.TempDir()
+	h := New(Config{DB: d, Cipher: c, DeployDir: deployDir, Docker: &fakeRunner{}})
+
+	id := seedMailcow(t, d, deployDir)
+
+	req := httptest.NewRequest("POST", "/service/"+itoa(id)+"/action?op=up", nil)
+	h.ServeHTTP(httptest.NewRecorder(), req)
+
+	deadline := time.Now().Add(2 * time.Second)
+	var last string
+	for time.Now().Before(deadline) {
+		sreq := httptest.NewRequest("GET", "/service/"+itoa(id)+"/status", nil)
+		srec := httptest.NewRecorder()
+		h.ServeHTTP(srec, sreq)
+		if srec.Code == http.StatusNoContent {
+			t.Fatalf("status endpoint should report a job after async up")
+		}
+		last = srec.Body.String()
+		if strings.Contains(last, `"running"`) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("async up never reached running state; last status: %s", last)
+}
+
+// TestMailcowStatusError reports a failed deployment (missing hostname) through
+// the status endpoint as an error state rather than running docker.
+func TestMailcowStatusError(t *testing.T) {
+	dbDir := filepath.Join(t.TempDir(), "test.db")
+	d, err := db.Open(dbDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { d.Close() })
+	c, _ := crypto.New("master")
+	deployDir := t.TempDir()
+	h := New(Config{DB: d, Cipher: c, DeployDir: deployDir, Docker: &fakeRunner{}})
+
+	id, err := d.CreateService("mailcow", "mail") // no hostname set
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest("POST", "/service/"+itoa(id)+"/action?op=up", nil)
+	h.ServeHTTP(httptest.NewRecorder(), req)
+
+	deadline := time.Now().Add(2 * time.Second)
+	var last string
+	for time.Now().Before(deadline) {
+		sreq := httptest.NewRequest("GET", "/service/"+itoa(id)+"/status", nil)
+		srec := httptest.NewRecorder()
+		h.ServeHTTP(srec, sreq)
+		last = srec.Body.String()
+		if strings.Contains(last, `"error"`) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("async up missing hostname should report error state; last: %s", last)
+}
+
+func TestSaveMailcowDoesNotCreateCompose(t *testing.T) {
+	dbDir := filepath.Join(t.TempDir(), "test.db")
+	d, err := db.Open(dbDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { d.Close() })
+	c, _ := crypto.New("master")
+	deployDir := t.TempDir()
+	h := New(Config{DB: d, Cipher: c, DeployDir: deployDir, Docker: &fakeRunner{}})
 
 	id, err := d.CreateService("mailcow", "mail")
 	if err != nil {
@@ -295,6 +741,122 @@ func TestShowServiceMailcowConfigLink(t *testing.T) {
 	}
 }
 
+func TestHardenMailcowIsIdempotent(t *testing.T) {
+	dir := t.TempDir()
+	mk := func(p, content string) string {
+		p = filepath.Join(dir, p)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	mk("data/conf/unbound/unbound.conf", "server:\n  do-ip6: yes\n  do-udp: yes\n")
+	mk("data/assets/ssl-example/cert.pem", "CERT")
+	mk("data/assets/ssl-example/key.pem", "KEY")
+	mk("data/assets/ssl-example/dhparams.pem", "DHP")
+
+	assertFiles := func() {
+		t.Helper()
+		conf, err := os.ReadFile(filepath.Join(dir, "data/conf/unbound/unbound.conf"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		s := string(conf)
+		if !strings.Contains(s, "do-ip6: no") {
+			t.Errorf("unbound should disable ipv6: %s", s)
+		}
+		if !strings.Contains(s, "forward-zone:") || !strings.Contains(s, "forward-addr: 1.1.1.1") {
+			t.Errorf("unbound should add forward zone: %s", s)
+		}
+		for _, f := range []string{"cert.pem", "key.pem", "dhparams.pem"} {
+			if data, err := os.ReadFile(filepath.Join(dir, "data/assets/ssl", f)); err != nil || string(data) == "" {
+				t.Errorf("ssl %s should be seeded: %v", f, err)
+			}
+		}
+	}
+
+	if err := hardenMailcow(dir); err != nil {
+		t.Fatalf("first run: %v", err)
+	}
+	assertFiles()
+	before, err := os.ReadFile(filepath.Join(dir, "data/conf/unbound/unbound.conf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeCerts, err := os.ReadFile(filepath.Join(dir, "data/assets/ssl/cert.pem"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Re-run: must be a no-op (no error, no changes).
+	if err := hardenMailcow(dir); err != nil {
+		t.Fatalf("second run: %v", err)
+	}
+	after, err := os.ReadFile(filepath.Join(dir, "data/conf/unbound/unbound.conf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	afterCerts, err := os.ReadFile(filepath.Join(dir, "data/assets/ssl/cert.pem"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(before) != string(after) {
+		t.Errorf("second run changed unbound.conf:\nbefore %q\nafter  %q", before, after)
+	}
+	if string(beforeCerts) != string(afterCerts) {
+		t.Errorf("second run changed seeded cert")
+	}
+}
+
+func TestHardenMailcowLeavesExistingConfigAlone(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "data/conf/unbound/unbound.conf")
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	original := "server:\n  do-ip6: no\n  forward-zone:\n    name: \".\"\n    forward-addr: 9.9.9.9\n"
+	if err := os.WriteFile(p, []byte(original), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ssl := filepath.Join(dir, "data/assets/ssl/cert.pem")
+	if err := os.MkdirAll(filepath.Dir(ssl), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(ssl, []byte("REALCERT"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := hardenMailcow(dir); err != nil {
+		t.Fatalf("harden: %v", err)
+	}
+	got, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != original {
+		t.Errorf("custom unbound.conf should be unchanged:\nwant %q\ngot  %q", original, got)
+	}
+	gotCert, err := os.ReadFile(ssl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(gotCert) != "REALCERT" {
+		t.Errorf("existing cert should be unchanged: %q", gotCert)
+	}
+}
+
+func TestHardenMailcowMissingFilesIsNoop(t *testing.T) {
+	// A checkout without unbound.conf or ssl-example (e.g. a minimal test
+	// fixtures dir) must not error.
+	dir := t.TempDir()
+	if err := hardenMailcow(dir); err != nil {
+		t.Fatalf("harden on bare dir should be a no-op: %v", err)
+	}
+}
+
 func TestDashboardMailcowShowsConfigLink(t *testing.T) {
 	d, h := testServer(t)
 	id, err := d.CreateService("mailcow", "mail")
@@ -322,8 +884,8 @@ func TestDashboardMailcowShowsConfigLink(t *testing.T) {
 		t.Fatalf("dashboard should render the mailcow config url link: %s", body)
 	}
 	for _, btn := range []string{"?op=up", "?op=restart", "?op=down"} {
-		if strings.Contains(body, btn) {
-			t.Fatalf("dashboard must not render lifecycle buttons for read-only mailcow (found %s): %s", btn, body)
+		if !strings.Contains(body, btn) {
+			t.Fatalf("dashboard must render lifecycle buttons for mailcow (missing %s): %s", btn, body)
 		}
 	}
 }
@@ -1001,28 +1563,27 @@ func TestDeleteMinioRemovesDataVolume(t *testing.T) {
 	}
 }
 
-func TestDeleteReadOnlyServiceSkipsDownButDeletes(t *testing.T) {
+func TestDeleteMailcowRunsDownAndDeletes(t *testing.T) {
 	d, err := db.Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { d.Close() })
 	c, _ := crypto.New("master")
+	deployDir := t.TempDir()
 	runner := &fakeRunner{}
-	h := New(Config{DB: d, Cipher: c, DeployDir: t.TempDir(), MailcowDir: t.TempDir(), Docker: runner})
-	id, err := d.CreateService("mailcow", "mail")
-	if err != nil {
-		t.Fatal(err)
-	}
+	h := New(Config{DB: d, Cipher: c, DeployDir: deployDir, Docker: runner})
+	id := seedMailcow(t, d, deployDir)
+
 	req := httptest.NewRequest("POST", "/service/"+itoa(id)+"/delete", nil)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusSeeOther {
 		t.Fatalf("delete status %d", rec.Code)
 	}
-	// mailcow is externally-managed: never run compose down against our deploy dir
-	if got := runner.recorded(); len(got) != 0 {
-		t.Fatalf("deleting a read-only service must not run compose, got %v", got)
+	// mailcow is lifecycle-controlled: deletion must bring its stack down.
+	if got := runner.recorded(); len(got) != 1 || got[0] != "compose down" {
+		t.Fatalf("deleting mailcow must run compose down, got %v", got)
 	}
 	if _, err := d.ServiceByID(id); err == nil {
 		t.Fatal("service row should be deleted")
@@ -1060,5 +1621,179 @@ func TestDeleteUnknownServiceNotFound(t *testing.T) {
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("deleting a missing service should be 404, got %d", rec.Code)
+	}
+}
+
+// TestSaveAutostartPersists verifies the start-on-boot checkbox save flow: the
+// flag is a universal config item (absent ⇒ off), toggled by the checkbox.
+func TestSaveAutostartPersists(t *testing.T) {
+	dbDir := filepath.Join(t.TempDir(), "test.db")
+	d, err := db.Open(dbDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { d.Close() })
+	c, _ := crypto.New("master")
+	h := New(Config{DB: d, Cipher: c, DeployDir: t.TempDir(), Docker: &fakeRunner{}})
+
+	id, err := d.CreateService("mailcow", "mail")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	save := func(checked bool) {
+		t.Helper()
+		form := url.Values{"MAILCOW_HOSTNAME": {"mail.example.com"}}
+		if checked {
+			form.Set("autostart", "on")
+		}
+		req := httptest.NewRequest("POST", "/service/"+itoa(id), strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusSeeOther {
+			t.Fatalf("save status %d (body %s)", rec.Code, rec.Body.String())
+		}
+	}
+
+	save(false)
+	items, _ := d.ConfigItems(id)
+	if items["autostart"] != "false" {
+		t.Fatalf("unchecked save must store autostart=false, got %q", items["autostart"])
+	}
+	save(true)
+	items, _ = d.ConfigItems(id)
+	if items["autostart"] != "true" {
+		t.Fatalf("checked save must store autostart=true, got %q", items["autostart"])
+	}
+	save(false)
+	items, _ = d.ConfigItems(id)
+	if items["autostart"] != "false" {
+		t.Fatalf("re-unchecking must store autostart=false, got %q", items["autostart"])
+	}
+}
+
+// TestServicePageShowsAutostart verifies the checkbox renders checked for a
+// service flagged to start on boot.
+func TestServicePageShowsAutostart(t *testing.T) {
+	dbDir := filepath.Join(t.TempDir(), "test.db")
+	d, err := db.Open(dbDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { d.Close() })
+	c, _ := crypto.New("master")
+	h := New(Config{DB: d, Cipher: c, DeployDir: t.TempDir(), Docker: &fakeRunner{}})
+
+	id, err := d.CreateService("mailcow", "mail")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.SetConfigItems(id, []db.ConfigItem{{Key: "autostart", Value: "true"}}); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest("GET", "/service/"+itoa(id), nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	body := rec.Body.String()
+	if !strings.Contains(body, `name="autostart"`) {
+		t.Fatalf("service page must render the start-on-boot checkbox: %s", body)
+	}
+	if !strings.Contains(body, `name="autostart"`+" checked") {
+		t.Fatalf("flagged service must render the checkbox checked: %s", body)
+	}
+}
+
+// TestAutoStartStartsFlaggedServices verifies that on app boot only services
+// with the start-on-boot flag get a compose `up` — through both the mailcow
+// background path and the synchronous upService path — and that unflagged
+// services are left alone.
+func TestAutoStartStartsFlaggedServices(t *testing.T) {
+	dbDir := filepath.Join(t.TempDir(), "test.db")
+	d, err := db.Open(dbDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { d.Close() })
+	c, _ := crypto.New("master")
+	deployDir := t.TempDir()
+	runner := &fakeRunner{}
+	h := New(Config{DB: d, Cipher: c, DeployDir: deployDir, Docker: runner})
+
+	seedMailcowDir := func(id int64) {
+		t.Helper()
+		dir := filepath.Join(deployDir, itoa(id))
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "docker-compose.yml"), []byte("services: {}\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Flagged mailcow: must come up via the background job path.
+	mail, err := d.CreateService("mailcow", "mail")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.SetConfigItems(mail, []db.ConfigItem{
+		{Key: "MAILCOW_HOSTNAME", Value: "mail.example.com"},
+		{Key: "autostart", Value: "true"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	seedMailcowDir(mail)
+
+	// Unflagged mailcow: must stay down.
+	other, err := d.CreateService("mailcow", "other")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.SetConfigItems(other, []db.ConfigItem{{Key: "MAILCOW_HOSTNAME", Value: "mail2.example.com"}}); err != nil {
+		t.Fatal(err)
+	}
+	seedMailcowDir(other)
+
+	// Flagged minio: must come up through the non-mailcow upService path.
+	min, err := d.CreateService("minio", "data2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.SetConfigItems(min, []db.ConfigItem{{Key: "autostart", Value: "true"}}); err != nil {
+		t.Fatal(err)
+	}
+	minDir := filepath.Join(deployDir, itoa(min))
+	if err := os.MkdirAll(minDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	h.AutoStart()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		ups := 0
+		for _, g := range runner.recorded() {
+			if g == "compose up -d --force-recreate" {
+				ups++
+			}
+		}
+		if ups >= 2 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	got := runner.recorded()
+	upCount := 0
+	for _, g := range got {
+		switch g {
+		case "compose up -d --force-recreate":
+			upCount++
+		case "compose down", "compose restart":
+			t.Fatalf("AutoStart must not run %q, got %v", g, got)
+		}
+	}
+	if upCount != 2 {
+		t.Fatalf("AutoStart must up exactly the flagged services (mailcow + minio), got %v", got)
 	}
 }
