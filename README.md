@@ -69,14 +69,41 @@ See [`.env.example`](.env.example) for a copy-paste template.
 
 There is no Docker container for mitia-ops itself — run the binary under
 systemd so it (and, via the *Start on boot* per-service flags, your whole stack)
-comes back after a reboot:
+comes back after a reboot.
+
+Installation is driven by [`scripts/install.sh`](scripts/install.sh). It installs
+the binary as a systemd service, generates a master key, and — when no binary
+was built locally — downloads the **latest** pre-built binary for your OS/arch
+from the GitHub release. No Go toolchain and no extra flags needed. If you built
+one with `make build` first, that one is installed instead.
+
+**Install a released binary (one-liner, no Go toolchain needed):**
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/jullury/mitia-ops/main/scripts/install.sh \
+  | sudo bash
+```
+
+This fetches `install.sh`, runs it as root, downloads the latest pre-built
+binary for your OS/arch from the GitHub release, and installs it as a systemd
+service.
+
+**Or clone the repo and run `install.sh` directly:**
+
+```sh
+git clone https://github.com/jullury/mitia-ops.git
+cd mitia-ops
+sudo ./scripts/install.sh
+```
+
+**Or build from source first, then run `install.sh`:**
 
 ```sh
 make build
-sudo make install     # -> scripts/install.sh
+sudo make install     # -> runs scripts/install.sh
 ```
 
-That installs a fixed layout:
+All paths run `scripts/install.sh` and install the same fixed layout:
 
 | Path                     | Purpose                                        |
 |--------------------------|------------------------------------------------|
@@ -96,6 +123,25 @@ it is stopped first so systemd can take over the listen port.
 
 Boot order: host boots → systemd starts mitia-ops → `AutoStart()` re-ups every
 service flagged *Start on boot* → your stack is reachable again.
+
+## Releases & versioning
+
+Versions are **bumped automatically** — no manual tagging required. On every
+push to `main`, [release-please](https://github.com/googleapis/release-please)
+reads the [conventional commit](https://www.conventionalcommits.org/) messages
+and figures out the next [semver](https://semver.org/) version:
+
+| Commit message prefix        | Result                                    |
+|------------------------------|-------------------------------------------|
+| `feat:` (new feature)        | minor bump → `0.1.0` → `0.2.0`            |
+| `fix:` / `docs:` / `chore:`  | patch bump → `0.1.0` → `0.1.1`            |
+| `BREAKING CHANGE:` (footer)  | major bump → `1.0.0`                      |
+
+When a release is warranted it opens a **release pull request** that, once
+merged, cuts the tag (e.g. `v0.2.0`), builds the OS/arch binaries, and publishes
+the GitHub Release. So please write commit messages in conventional style (the
+repo's existing history already is) and let `main` decide when to ship. To check
+what the next release will look like, open the most recent release PR.
 
 **Accessing the dashboard on a headless VPS.** By default the dashboard binds
 `MITIAOPS_ADDR` (default `:8080`) on **all** interfaces. On a public VPS you

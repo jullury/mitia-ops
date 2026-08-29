@@ -8,7 +8,12 @@
 #   * a master key is only generated when there is no existing encrypted
 #     store to keep readable — see MASTER KEY below
 #
-# Run as root:  make build && sudo make install
+# Run as root. If a binary was built locally (make build), that is installed;
+# otherwise the latest GitHub release binary for this OS/arch is downloaded
+# automatically — no extra flags needed:
+#   sudo ./scripts/install.sh
+#   # or one-liner:
+#   curl -fsSL https://raw.githubusercontent.com/jullury/mitia-ops/main/scripts/install.sh | sudo bash
 
 set -euo pipefail
 
@@ -26,9 +31,41 @@ if [[ "$(id -u)" -ne 0 ]]; then
 	exit 1
 fi
 
+# --- binary ----------------------------------------------------------------
+# Prefer a locally-built binary; otherwise download the latest release for this
+# OS/arch. This is what makes a fresh machine a one-liner instead of needing a
+# Go toolchain.
+fetch_binary() {
+	local url="$1"
+	local tmp
+	tmp="$(mktemp)"
+	if command -v curl >/dev/null 2>&1; then
+		curl -fsSL "$url" -o "$tmp"
+	elif command -v wget >/dev/null 2>&1; then
+		wget -qO "$tmp" "$url"
+	else
+		echo "need curl or wget to download the binary" >&2
+		return 1
+	fi
+	mkdir -p "$(dirname "$BIN_SRC")"
+	install -m 0755 "$tmp" "$BIN_SRC"
+	rm -f "$tmp"
+}
+
 if [[ ! -x "$BIN_SRC" ]]; then
-	echo "'$BIN_SRC' not found — run 'make build' first" >&2
-	exit 1
+	# Resolve the latest release asset name for this platform.
+	local_os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+	local_arch="$(uname -m)"
+	case "$local_os:$local_arch" in
+		linux:x86_64) asset="mitia-ops-linux-amd64" ;;
+		linux:aarch64 | linux:arm64) asset="mitia-ops-linux-arm64" ;;
+		linux:armv7l | linux:armv6l) asset="mitia-ops-linux-arm" ;;
+		darwin:x86_64) asset="mitia-ops-darwin-amd64" ;;
+		darwin:arm64) asset="mitia-ops-darwin-arm64" ;;
+		*) echo "unsupported platform: $local_os/$local_arch" >&2; exit 1 ;;
+	esac
+	echo "downloading latest release binary ($asset)"
+	fetch_binary "https://github.com/jullury/mitia-ops/releases/latest/download/$asset"
 fi
 
 # --- master key ------------------------------------------------------------
