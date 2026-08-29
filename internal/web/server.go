@@ -12,10 +12,10 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
-	"strconv"
 	"strings"
 	"sync"
 
+	"github.com/google/uuid"
 	"github.com/jullury/mitia-ops/internal/crypto"
 	"github.com/jullury/mitia-ops/internal/db"
 	"github.com/jullury/mitia-ops/internal/docker"
@@ -131,27 +131,27 @@ type job struct {
 // the polling UI can read the final state before it clears.
 type jobTracker struct {
 	mu   sync.Mutex
-	jobs map[int64]job
+	jobs map[string]job
 }
 
 func newJobTracker() *jobTracker {
-	return &jobTracker{jobs: map[int64]job{}}
+	return &jobTracker{jobs: map[string]job{}}
 }
 
-func (t *jobTracker) set(id int64, state JobState, msg, err string) {
+func (t *jobTracker) set(id string, state JobState, msg, err string) {
 	t.mu.Lock()
 	t.jobs[id] = job{state: state, msg: msg, err: err}
 	t.mu.Unlock()
 }
 
-func (t *jobTracker) get(id int64) (job, bool) {
+func (t *jobTracker) get(id string) (job, bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	j, ok := t.jobs[id]
 	return j, ok
 }
 
-func (t *jobTracker) active(id int64) bool {
+func (t *jobTracker) active(id string) bool {
 	j, ok := t.get(id)
 	return ok && (j.state == JobCloning || j.state == JobPulling)
 }
@@ -334,12 +334,12 @@ func (s *server) newService(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	http.Redirect(w, r, "/service/"+strconv.FormatInt(id, 10), http.StatusSeeOther)
+	http.Redirect(w, r, "/service/"+id, http.StatusSeeOther)
 }
 
 func (s *server) showService(w http.ResponseWriter, r *http.Request) {
 	id := idFromPath(w, r)
-	if id == 0 {
+	if id == "" {
 		return
 	}
 	msg := r.URL.Query().Get("msg")
@@ -354,7 +354,7 @@ func (s *server) showService(w http.ResponseWriter, r *http.Request) {
 // error so the user sees the error inline rather than a bare error page).
 // The saved values are re-read from the DB; on an error the prior (persisted)
 // values are shown, since nothing was written.
-func (s *server) renderService(w http.ResponseWriter, r *http.Request, id int64, msg string, msgErr bool) {
+func (s *server) renderService(w http.ResponseWriter, r *http.Request, id string, msg string, msgErr bool) {
 	svc, err := s.cfg.DB.ServiceByID(id)
 	if err != nil {
 		http.NotFound(w, r)
@@ -422,7 +422,7 @@ func hasSizeField(def services.Definition) bool {
 
 func (s *server) saveService(w http.ResponseWriter, r *http.Request) {
 	id := idFromPath(w, r)
-	if id == 0 {
+	if id == "" {
 		return
 	}
 	svc, err := s.cfg.DB.ServiceByID(id)
@@ -594,12 +594,12 @@ func (s *server) saveService(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	http.Redirect(w, r, "/service/"+strconv.FormatInt(id, 10)+"?msg=saved", http.StatusSeeOther)
+	http.Redirect(w, r, "/service/"+id+"?msg=saved", http.StatusSeeOther)
 }
 
 func (s *server) serviceAction(w http.ResponseWriter, r *http.Request) {
 	id := idFromPath(w, r)
-	if id == 0 {
+	if id == "" {
 		return
 	}
 	op := r.URL.Query().Get("op")
@@ -630,7 +630,7 @@ func (s *server) serviceAction(w http.ResponseWriter, r *http.Request) {
 	// stay synchronous because the deployment is already on disk by then.
 	if def.Kind == services.KindMailcow && op == "up" {
 		s.startMailcowUp(id)
-		http.Redirect(w, r, "/service/"+itoa(id)+"?deploying=1", http.StatusSeeOther)
+		http.Redirect(w, r, "/service/"+id+"?deploying=1", http.StatusSeeOther)
 		return
 	}
 
@@ -645,7 +645,7 @@ func (s *server) serviceAction(w http.ResponseWriter, r *http.Request) {
 				q := url.Values{}
 				q.Set("err", "1")
 				q.Set("msg", prepErr.err.Error())
-				http.Redirect(w, r, "/service/"+itoa(id)+"?"+q.Encode(), http.StatusSeeOther)
+				http.Redirect(w, r, "/service/"+id+"?"+q.Encode(), http.StatusSeeOther)
 			} else {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 			}
@@ -667,7 +667,7 @@ func (s *server) serviceAction(w http.ResponseWriter, r *http.Request) {
 				q := url.Values{}
 				q.Set("err", "1")
 				q.Set("msg", err.Error())
-				http.Redirect(w, r, "/service/"+itoa(id)+"?"+q.Encode(), http.StatusSeeOther)
+				http.Redirect(w, r, "/service/"+id+"?"+q.Encode(), http.StatusSeeOther)
 				return
 			}
 		}
@@ -703,7 +703,7 @@ func (e *servicePrepareError) Unwrap() error { return e.err }
 // start is delegated to the background job runner instead. Prepare failures
 // are wrapped as *servicePrepareError so callers can distinguish them; every
 // other failure is returned as-is.
-func (s *server) upService(id int64) error {
+func (s *server) upService(id string) error {
 	svc, err := s.cfg.DB.ServiceByID(id)
 	if err != nil {
 		return err
@@ -770,7 +770,7 @@ func (s *server) AutoStart() {
 	for _, svc := range svcs {
 		items, err := s.cfg.DB.ConfigItems(svc.ID)
 		if err != nil {
-			log.Printf("autostart %s (%s id=%d): read config: %v", svc.Name, svc.Kind, svc.ID, err)
+			log.Printf("autostart %s (%s id=%s): read config: %v", svc.Name, svc.Kind, svc.ID, err)
 			continue
 		}
 		if strings.TrimSpace(items[autostartKey]) != "true" {
@@ -779,7 +779,7 @@ func (s *server) AutoStart() {
 		svc := svc
 		go func() {
 			if err := s.upService(svc.ID); err != nil {
-				log.Printf("autostart %s (%s id=%d): %v", svc.Name, svc.Kind, svc.ID, err)
+				log.Printf("autostart %s (%s id=%s): %v", svc.Name, svc.Kind, svc.ID, err)
 			}
 		}()
 	}
@@ -789,7 +789,7 @@ func (s *server) AutoStart() {
 // long) mailcow deployment: clone the upstream stack, then `compose up`, while
 // updating a per-service job so the UI can show live progress. It refuses to
 // start a second deployment while one is already in flight for the service.
-func (s *server) startMailcowUp(id int64) {
+func (s *server) startMailcowUp(id string) {
 	if s.jobs.active(id) {
 		return
 	}
@@ -819,7 +819,7 @@ func (s *server) startMailcowUp(id int64) {
 // polling.
 func (s *server) serviceStatus(w http.ResponseWriter, r *http.Request) {
 	id := idFromPath(w, r)
-	if id == 0 {
+	if id == "" {
 		return
 	}
 	j, ok := s.jobs.get(id)
@@ -836,7 +836,7 @@ func (s *server) serviceStatus(w http.ResponseWriter, r *http.Request) {
 // deploy directory, and finally removes the DB row (config items cascade).
 func (s *server) deleteService(w http.ResponseWriter, r *http.Request) {
 	id := idFromPath(w, r)
-	if id == 0 {
+	if id == "" {
 		return
 	}
 	svc, err := s.cfg.DB.ServiceByID(id)
@@ -1085,11 +1085,11 @@ func prepareMailcow(s *server, dir string, values map[string]string) error {
 // credentials are a hard error: the volumes are bound to whatever password they
 // were initialized with, so silently minting a fresh set would reproduce the
 // same drift this guards against.
-func (s *server) resolveMailcowSecrets(dir string, values map[string]string) (int64, error) {
+func (s *server) resolveMailcowSecrets(dir string, values map[string]string) (string, error) {
 	// Deploy dirs are named after the service id, so the dir carries the id.
-	id, err := strconv.ParseInt(filepath.Base(dir), 10, 64)
-	if err != nil {
-		return 0, fmt.Errorf("mailcow deploy dir %q does not carry a service id", dir)
+	id := filepath.Base(dir)
+	if id == "" || id == "." || id == string(filepath.Separator) {
+		return "", fmt.Errorf("mailcow deploy dir %q does not carry a service id", dir)
 	}
 	items, err := s.cfg.DB.ConfigItems(id)
 	if err != nil {
@@ -1232,7 +1232,7 @@ func seedMailcowSelfSignedCert(dir string) error {
 // compose-default project-scoped name for the service's resizeable volume.
 // Called wherever the compose is rendered so the external volume always points
 // at a real volume. Non-resizeable services are left untouched.
-func (s *server) injectVolumeName(dir string, id int64, kind services.Kind, values map[string]string) {
+func (s *server) injectVolumeName(dir string, id string, kind services.Kind, values map[string]string) {
 	namedVolume, ok := resizeVolumeNames[kind]
 	if !ok {
 		return
@@ -1274,7 +1274,7 @@ func (s *server) sizePreflight(dir, newSize string) (int64, int, string, bool) {
 	return newBytes, 0, "", true
 }
 
-func (s *server) doResize(w http.ResponseWriter, r *http.Request, id int64, def services.Definition, dir, namedVolume string, items []db.ConfigItem, values map[string]string) {
+func (s *server) doResize(w http.ResponseWriter, r *http.Request, id string, def services.Definition, dir, namedVolume string, items []db.ConfigItem, values map[string]string) {
 	if s.cfg.DockerRaw == nil {
 		http.Error(w, "volume resize not supported by this Docker runner", 500)
 		return
@@ -1374,7 +1374,7 @@ func (s *server) doResize(w http.ResponseWriter, r *http.Request, id int64, def 
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	http.Redirect(w, r, "/service/"+itoa(id)+"?msg=resized", http.StatusSeeOther)
+	http.Redirect(w, r, "/service/"+id+"?msg=resized", http.StatusSeeOther)
 }
 
 // prettyBytes renders a byte count as a human-readable size for error messages.
@@ -1391,8 +1391,8 @@ func prettyBytes(n int64) string {
 	}
 }
 
-func (s *server) deployDir(id int64) string {
-	return s.cfg.DeployDir + "/" + strconv.FormatInt(id, 10)
+func (s *server) deployDir(id string) string {
+	return s.cfg.DeployDir + "/" + id
 }
 
 func (s *server) statusDir(svc db.Service) string {
@@ -1440,13 +1440,11 @@ func decryptValues(c *crypto.Cipher, def services.Definition, items map[string]s
 	return out, secrets, lists
 }
 
-func idFromPath(w http.ResponseWriter, r *http.Request) int64 {
-	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
-	if err != nil {
+func idFromPath(w http.ResponseWriter, r *http.Request) string {
+	id := r.PathValue("id")
+	if _, err := uuid.Parse(id); err != nil {
 		http.NotFound(w, r)
-		return 0
+		return ""
 	}
 	return id
 }
-
-func itoa(id int64) string { return strconv.FormatInt(id, 10) }

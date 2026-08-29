@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jullury/mitia-ops/internal/crypto"
 	"github.com/jullury/mitia-ops/internal/db"
 )
@@ -77,7 +78,7 @@ func TestDashboard(t *testing.T) {
 	body := rec.Body.String()
 	// assert a service-row-specific marker, not just "minio" (always present
 	// as a dropdown option)
-	if !strings.Contains(body, `href="/service/`+itoa(id)+`"`) {
+	if !strings.Contains(body, `href="/service/`+id+`"`) {
 		t.Fatalf("dashboard should link to the service row: %s", body)
 	}
 	if !strings.Contains(body, "main") {
@@ -118,7 +119,7 @@ func TestActionFlash(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	req := httptest.NewRequest("POST", "/service/"+itoa(id)+"/action?op=up", nil)
+	req := httptest.NewRequest("POST", "/service/"+id+"/action?op=up", nil)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusSeeOther {
@@ -142,7 +143,7 @@ func TestUnknownActionOpRejected(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	req := httptest.NewRequest("POST", "/service/"+itoa(id)+"/action?op=explode", nil)
+	req := httptest.NewRequest("POST", "/service/"+id+"/action?op=explode", nil)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusBadRequest {
@@ -154,7 +155,7 @@ func TestSaveAndShowService(t *testing.T) {
 	d, h := testServer(t)
 	id, _ := d.CreateService("minio", "main")
 	form := "MINIO_ROOT_USER=admin&MINIO_ROOT_PASSWORD=supersecret&MINIO_HOSTNAME=s3.example.com"
-	req := httptest.NewRequest("POST", "/service/"+itoa(id), strings.NewReader(form))
+	req := httptest.NewRequest("POST", "/service/"+id, strings.NewReader(form))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
@@ -178,8 +179,8 @@ func TestUpActionRemovesEphemeralEnv(t *testing.T) {
 	c, _ := crypto.New("master")
 	deployDir := t.TempDir()
 
-	save := func(id int64, form string) {
-		req := httptest.NewRequest("POST", "/service/"+itoa(id), strings.NewReader(form))
+	save := func(id string, form string) {
+		req := httptest.NewRequest("POST", "/service/"+id, strings.NewReader(form))
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		rec := httptest.NewRecorder()
 		New(Config{DB: d, Cipher: c, DeployDir: deployDir, Docker: &fakeRunner{}}).ServeHTTP(rec, req)
@@ -191,12 +192,12 @@ func TestUpActionRemovesEphemeralEnv(t *testing.T) {
 	id, _ := d.CreateService("minio", "main")
 	save(id, "MINIO_ROOT_PASSWORD=supersecret&MINIO_HOSTNAME=s3.example.com&MINIO_ROOT_USER=admin")
 
-	envPath := filepath.Join(deployDir, itoa(id), ".env")
+	envPath := filepath.Join(deployDir, id, ".env")
 	if _, err := os.Stat(envPath); !os.IsNotExist(err) {
 		t.Fatal("saveService must not write a .env (secrets stay in SQLite)")
 	}
 
-	req := httptest.NewRequest("POST", "/service/"+itoa(id)+"/action?op=up", nil)
+	req := httptest.NewRequest("POST", "/service/"+id+"/action?op=up", nil)
 	rec := httptest.NewRecorder()
 	New(Config{DB: d, Cipher: c, DeployDir: deployDir, Docker: &fakeRunner{}}).ServeHTTP(rec, req)
 	if rec.Code != http.StatusSeeOther {
@@ -211,13 +212,13 @@ func TestUpActionRemovesEphemeralEnv(t *testing.T) {
 // and a deploy dir that already contains an upstream docker-compose.yml, so the
 // launch prepare step reuses the checkout instead of cloning (which needs git
 // + network). Returns the service id and the deploy dir.
-func seedMailcow(t *testing.T, d *db.DB, deployDir string) int64 {
+func seedMailcow(t *testing.T, d *db.DB, deployDir string) string {
 	t.Helper()
 	id, err := d.CreateService("mailcow", "mail")
 	if err != nil {
 		t.Fatal(err)
 	}
-	dir := filepath.Join(deployDir, itoa(id))
+	dir := filepath.Join(deployDir, id)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -247,7 +248,7 @@ func TestMailcowLifecycleRunsCompose(t *testing.T) {
 	h := New(Config{DB: d, Cipher: c, DeployDir: deployDir, Docker: runner})
 
 	id := seedMailcow(t, d, deployDir)
-	dir := filepath.Join(deployDir, itoa(id))
+	dir := filepath.Join(deployDir, id)
 
 	// Wait for a command to appear in the fake runner, or time out. The mailcow
 	// `up` runs in a background goroutine (so the browser can show progress
@@ -270,7 +271,7 @@ func TestMailcowLifecycleRunsCompose(t *testing.T) {
 
 	// `up` is asynchronous: the handler redirects immediately and the compose
 	// run happens in the background.
-	req := httptest.NewRequest("POST", "/service/"+itoa(id)+"/action?op=up", nil)
+	req := httptest.NewRequest("POST", "/service/"+id+"/action?op=up", nil)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusSeeOther {
@@ -280,7 +281,7 @@ func TestMailcowLifecycleRunsCompose(t *testing.T) {
 
 	// `restart` runs synchronously and immediately recorded.
 	before := len(runner.recorded())
-	req = httptest.NewRequest("POST", "/service/"+itoa(id)+"/action?op=restart", nil)
+	req = httptest.NewRequest("POST", "/service/"+id+"/action?op=restart", nil)
 	rec = httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusSeeOther {
@@ -293,7 +294,7 @@ func TestMailcowLifecycleRunsCompose(t *testing.T) {
 
 	// `down` runs synchronously and immediately recorded.
 	before = len(runner.recorded())
-	req = httptest.NewRequest("POST", "/service/"+itoa(id)+"/action?op=down", nil)
+	req = httptest.NewRequest("POST", "/service/"+id+"/action?op=down", nil)
 	rec = httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusSeeOther {
@@ -348,14 +349,14 @@ func TestMailcowRecloneKeepsCredentials(t *testing.T) {
 	h := New(Config{DB: d, Cipher: c, DeployDir: deployDir, Docker: runner})
 
 	id := seedMailcow(t, d, deployDir)
-	dir := filepath.Join(deployDir, itoa(id))
+	dir := filepath.Join(deployDir, id)
 
 	// up runs the async mailcow flow; return once a new compose command lands
 	// in the fake runner (the conf/prepare step runs before it, so by then the
 	// file is written).
 	up := func(prior int) {
 		t.Helper()
-		req := httptest.NewRequest("POST", "/service/"+itoa(id)+"/action?op=up", nil)
+		req := httptest.NewRequest("POST", "/service/"+id+"/action?op=up", nil)
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
 		if rec.Code != http.StatusSeeOther {
@@ -436,14 +437,14 @@ func TestMailcowSavedPortPropagatesToConf(t *testing.T) {
 	h := New(Config{DB: d, Cipher: c, DeployDir: deployDir, Docker: runner})
 
 	id := seedMailcow(t, d, deployDir) // MAILCOW_HTTP_PORT=8080
-	dir := filepath.Join(deployDir, itoa(id))
+	dir := filepath.Join(deployDir, id)
 
 	// up runs the async mailcow flow; return once a new compose command lands
 	// in the fake runner (the conf/prepare step runs before it, so by then the
 	// file is written).
 	up := func(prior int) {
 		t.Helper()
-		req := httptest.NewRequest("POST", "/service/"+itoa(id)+"/action?op=up", nil)
+		req := httptest.NewRequest("POST", "/service/"+id+"/action?op=up", nil)
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
 		if rec.Code != http.StatusSeeOther {
@@ -473,7 +474,7 @@ func TestMailcowSavedPortPropagatesToConf(t *testing.T) {
 	// The operator edits the port and saves. mailcow renders nothing on save
 	// (config is materialized at launch), so only the stored value changes.
 	form := url.Values{"MAILCOW_HOSTNAME": {"mail.example.com"}, "MAILCOW_HTTP_PORT": {"2111"}}
-	req := httptest.NewRequest("POST", "/service/"+itoa(id), strings.NewReader(form.Encode()))
+	req := httptest.NewRequest("POST", "/service/"+id, strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
@@ -507,7 +508,7 @@ func TestMailcowAdoptsExistingConfSecrets(t *testing.T) {
 	c, _ := crypto.New("master")
 	deployDir := t.TempDir()
 	id := seedMailcow(t, d, deployDir) // MAILCOW_HTTP_PORT=8080, store empty
-	dir := filepath.Join(deployDir, itoa(id))
+	dir := filepath.Join(deployDir, id)
 
 	seed := "MAILCOW_HOSTNAME=mail.example.com\n" +
 		"DBPASS=legacy-db-pass\nDBROOT=legacy-db-root\nREDISPASS=legacy-redis-pass\n" +
@@ -578,7 +579,7 @@ func TestMailcowStoredSecretCorruptionErrors(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := &server{cfg: Config{DB: d, Cipher: c, DeployDir: deployDir}}
-	err = prepareMailcow(s, filepath.Join(deployDir, itoa(id)), map[string]string{"MAILCOW_HOSTNAME": "mail.example.com"})
+	err = prepareMailcow(s, filepath.Join(deployDir, id), map[string]string{"MAILCOW_HOSTNAME": "mail.example.com"})
 	if err == nil {
 		t.Fatal("undecryptable stored credentials must abort the launch, got nil")
 	}
@@ -603,7 +604,7 @@ func TestMailcowUpRequiresHostname(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	req := httptest.NewRequest("POST", "/service/"+itoa(id)+"/action?op=up", nil)
+	req := httptest.NewRequest("POST", "/service/"+id+"/action?op=up", nil)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusSeeOther {
@@ -629,13 +630,13 @@ func TestMailcowStatusEndpointLiveProgress(t *testing.T) {
 
 	id := seedMailcow(t, d, deployDir)
 
-	req := httptest.NewRequest("POST", "/service/"+itoa(id)+"/action?op=up", nil)
+	req := httptest.NewRequest("POST", "/service/"+id+"/action?op=up", nil)
 	h.ServeHTTP(httptest.NewRecorder(), req)
 
 	deadline := time.Now().Add(2 * time.Second)
 	var last string
 	for time.Now().Before(deadline) {
-		sreq := httptest.NewRequest("GET", "/service/"+itoa(id)+"/status", nil)
+		sreq := httptest.NewRequest("GET", "/service/"+id+"/status", nil)
 		srec := httptest.NewRecorder()
 		h.ServeHTTP(srec, sreq)
 		if srec.Code == http.StatusNoContent {
@@ -668,13 +669,13 @@ func TestMailcowStatusError(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	req := httptest.NewRequest("POST", "/service/"+itoa(id)+"/action?op=up", nil)
+	req := httptest.NewRequest("POST", "/service/"+id+"/action?op=up", nil)
 	h.ServeHTTP(httptest.NewRecorder(), req)
 
 	deadline := time.Now().Add(2 * time.Second)
 	var last string
 	for time.Now().Before(deadline) {
-		sreq := httptest.NewRequest("GET", "/service/"+itoa(id)+"/status", nil)
+		sreq := httptest.NewRequest("GET", "/service/"+id+"/status", nil)
 		srec := httptest.NewRecorder()
 		h.ServeHTTP(srec, sreq)
 		last = srec.Body.String()
@@ -702,14 +703,14 @@ func TestSaveMailcowDoesNotCreateCompose(t *testing.T) {
 		t.Fatal(err)
 	}
 	form := "MAILCOW_HTTP_PORT=8080"
-	req := httptest.NewRequest("POST", "/service/"+itoa(id), strings.NewReader(form))
+	req := httptest.NewRequest("POST", "/service/"+id, strings.NewReader(form))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusSeeOther {
 		t.Fatalf("save status %d", rec.Code)
 	}
-	if _, err := os.Stat(filepath.Join(deployDir, itoa(id))); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(deployDir, id)); !os.IsNotExist(err) {
 		t.Fatalf("saving a read-only service must not create its deploy dir (got %v)", err)
 	}
 }
@@ -721,7 +722,7 @@ func TestShowServiceMailcowConfigLink(t *testing.T) {
 		t.Fatal(err)
 	}
 	form := "MAILCOW_HTTP_PORT=8080"
-	req := httptest.NewRequest("POST", "/service/"+itoa(id), strings.NewReader(form))
+	req := httptest.NewRequest("POST", "/service/"+id, strings.NewReader(form))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
@@ -729,7 +730,7 @@ func TestShowServiceMailcowConfigLink(t *testing.T) {
 		t.Fatalf("save status %d", rec.Code)
 	}
 
-	req = httptest.NewRequest("GET", "/service/"+itoa(id), nil)
+	req = httptest.NewRequest("GET", "/service/"+id, nil)
 	rec = httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	if rec.Code != 200 {
@@ -865,7 +866,7 @@ func TestDashboardMailcowShowsConfigLink(t *testing.T) {
 	}
 	// set the http port so a config url can be derived
 	form := "MAILCOW_HTTP_PORT=8080"
-	req := httptest.NewRequest("POST", "/service/"+itoa(id), strings.NewReader(form))
+	req := httptest.NewRequest("POST", "/service/"+id, strings.NewReader(form))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
@@ -905,7 +906,7 @@ func TestSaveCloudflaredPersistsIngressAndCompose(t *testing.T) {
 	form := "CF_TUNNEL=my-tunnel" +
 		"&CF_INGRESS_0_HOST=app.example.com&CF_INGRESS_0_SERVICE=http%3A%2F%2Flocalhost%3A8080" +
 		"&CF_INGRESS_1_HOST=web.example.com&CF_INGRESS_1_SERVICE=http%3A%2F%2Flocalhost%3A9001"
-	req := httptest.NewRequest("POST", "/service/"+itoa(id), strings.NewReader(form))
+	req := httptest.NewRequest("POST", "/service/"+id, strings.NewReader(form))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
@@ -921,7 +922,7 @@ func TestSaveCloudflaredPersistsIngressAndCompose(t *testing.T) {
 		t.Fatalf("tunnel name not persisted: %+v", items)
 	}
 
-	dir := filepath.Join(deployDir, itoa(id))
+	dir := filepath.Join(deployDir, id)
 	if _, err := os.Stat(filepath.Join(dir, "docker-compose.yml")); err != nil {
 		t.Fatalf("save must write docker-compose.yml: %v", err)
 	}
@@ -969,7 +970,7 @@ func TestUpCloudflaredWritesCredsAndConfig(t *testing.T) {
 
 	id, _ := d.CreateService("cloudflared", "tun")
 	form := "CF_TUNNEL=my-tunnel&CF_INGRESS_0_HOST=app.example.com&CF_INGRESS_0_SERVICE=http%3A%2F%2Flocalhost%3A8080"
-	save := httptest.NewRequest("POST", "/service/"+itoa(id), strings.NewReader(form))
+	save := httptest.NewRequest("POST", "/service/"+id, strings.NewReader(form))
 	save.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, save)
@@ -977,14 +978,14 @@ func TestUpCloudflaredWritesCredsAndConfig(t *testing.T) {
 		t.Fatalf("save status %d", rec.Code)
 	}
 
-	up := httptest.NewRequest("POST", "/service/"+itoa(id)+"/action?op=up", nil)
+	up := httptest.NewRequest("POST", "/service/"+id+"/action?op=up", nil)
 	rec = httptest.NewRecorder()
 	h.ServeHTTP(rec, up)
 	if rec.Code != http.StatusSeeOther {
 		t.Fatalf("up status %d: %s", rec.Code, rec.Body.String())
 	}
 
-	dir := filepath.Join(deployDir, itoa(id))
+	dir := filepath.Join(deployDir, id)
 	cfgBytes, err := os.ReadFile(filepath.Join(dir, "config.yml"))
 	if err != nil {
 		t.Fatalf("launch must write config.yml: %v", err)
@@ -1047,7 +1048,7 @@ func TestUpCloudflaredReusesCachedCredsWhenTunnelExists(t *testing.T) {
 	h := New(Config{DB: d, Cipher: c, DeployDir: deployDir, Docker: &fakeRunner{}, Cloudflared: &reuseCloudflared{}})
 
 	id, _ := d.CreateService("cloudflared", "tun")
-	dir := filepath.Join(deployDir, itoa(id))
+	dir := filepath.Join(deployDir, id)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -1057,7 +1058,7 @@ func TestUpCloudflaredReusesCachedCredsWhenTunnelExists(t *testing.T) {
 	}
 
 	form := "CF_TUNNEL=my-tunnel&CF_INGRESS_0_HOST=app.example.com&CF_INGRESS_0_SERVICE=http%3A%2F%2Flocalhost%3A8080"
-	save := httptest.NewRequest("POST", "/service/"+itoa(id), strings.NewReader(form))
+	save := httptest.NewRequest("POST", "/service/"+id, strings.NewReader(form))
 	save.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, save)
@@ -1065,7 +1066,7 @@ func TestUpCloudflaredReusesCachedCredsWhenTunnelExists(t *testing.T) {
 		t.Fatalf("save status %d", rec.Code)
 	}
 
-	up := httptest.NewRequest("POST", "/service/"+itoa(id)+"/action?op=up", nil)
+	up := httptest.NewRequest("POST", "/service/"+id+"/action?op=up", nil)
 	rec = httptest.NewRecorder()
 	h.ServeHTTP(rec, up)
 	if rec.Code != http.StatusSeeOther {
@@ -1088,7 +1089,7 @@ func TestUpCloudflaredErrorsWhenExistingTunnelHasNoCachedCreds(t *testing.T) {
 
 	id, _ := d.CreateService("cloudflared", "tun")
 	form := "CF_TUNNEL=my-tunnel&CF_INGRESS_0_HOST=app.example.com&CF_INGRESS_0_SERVICE=http%3A%2F%2Flocalhost%3A8080"
-	save := httptest.NewRequest("POST", "/service/"+itoa(id), strings.NewReader(form))
+	save := httptest.NewRequest("POST", "/service/"+id, strings.NewReader(form))
 	save.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, save)
@@ -1096,7 +1097,7 @@ func TestUpCloudflaredErrorsWhenExistingTunnelHasNoCachedCreds(t *testing.T) {
 		t.Fatalf("save status %d", rec.Code)
 	}
 
-	up := httptest.NewRequest("POST", "/service/"+itoa(id)+"/action?op=up", nil)
+	up := httptest.NewRequest("POST", "/service/"+id+"/action?op=up", nil)
 	rec = httptest.NewRecorder()
 	h.ServeHTTP(rec, up)
 	if rec.Code != http.StatusSeeOther {
@@ -1137,7 +1138,7 @@ func TestUpCloudflaredPromptsForLoginWhenNotLoggedIn(t *testing.T) {
 
 	id, _ := d.CreateService("cloudflared", "tun")
 	form := "CF_TUNNEL=my-tunnel&CF_INGRESS_0_HOST=app.example.com&CF_INGRESS_0_SERVICE=http://localhost:8080"
-	save := httptest.NewRequest("POST", "/service/"+itoa(id), strings.NewReader(form))
+	save := httptest.NewRequest("POST", "/service/"+id, strings.NewReader(form))
 	save.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, save)
@@ -1145,13 +1146,13 @@ func TestUpCloudflaredPromptsForLoginWhenNotLoggedIn(t *testing.T) {
 		t.Fatalf("save status %d", rec.Code)
 	}
 
-	up := httptest.NewRequest("POST", "/service/"+itoa(id)+"/action?op=up", nil)
+	up := httptest.NewRequest("POST", "/service/"+id+"/action?op=up", nil)
 	rec = httptest.NewRecorder()
 	h.ServeHTTP(rec, up)
 	if rec.Code != http.StatusSeeOther {
 		t.Fatalf("up should redirect back to the service page, got %d", rec.Code)
 	}
-	if !strings.HasPrefix(rec.Header().Get("Location"), "/service/"+itoa(id)+"?") {
+	if !strings.HasPrefix(rec.Header().Get("Location"), "/service/"+id+"?") {
 		t.Fatalf("expected redirect to the service page, got %v", rec.Header().Get("Location"))
 	}
 
@@ -1196,7 +1197,7 @@ func TestResaveCloudflaredRemovesStaleIngressRows(t *testing.T) {
 	id, _ := d.CreateService("cloudflared", "tun")
 
 	save := func(form string) {
-		req := httptest.NewRequest("POST", "/service/"+itoa(id), strings.NewReader(form))
+		req := httptest.NewRequest("POST", "/service/"+id, strings.NewReader(form))
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
@@ -1226,7 +1227,7 @@ func TestShowCloudflaredPrefillsRoutingRows(t *testing.T) {
 		t.Fatal(err)
 	}
 	form := "CF_TUNNEL=my-tunnel&CF_INGRESS_0_HOST=app.example.com&CF_INGRESS_0_SERVICE=http%3A%2F%2Flocalhost%3A8080"
-	req := httptest.NewRequest("POST", "/service/"+itoa(id), strings.NewReader(form))
+	req := httptest.NewRequest("POST", "/service/"+id, strings.NewReader(form))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
@@ -1234,7 +1235,7 @@ func TestShowCloudflaredPrefillsRoutingRows(t *testing.T) {
 		t.Fatalf("save status %d", rec.Code)
 	}
 
-	req = httptest.NewRequest("GET", "/service/"+itoa(id), nil)
+	req = httptest.NewRequest("GET", "/service/"+id, nil)
 	rec = httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	if rec.Code != 200 {
@@ -1266,7 +1267,7 @@ func TestSaveCloudflaredRejectsPartialIngressRow(t *testing.T) {
 	id, _ := d.CreateService("cloudflared", "tun")
 
 	form := "CF_TUNNEL=my-tunnel&CF_INGRESS_0_HOST=app.example.com"
-	req := httptest.NewRequest("POST", "/service/"+itoa(id), strings.NewReader(form))
+	req := httptest.NewRequest("POST", "/service/"+id, strings.NewReader(form))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
@@ -1293,7 +1294,7 @@ func TestSaveCloudflaredRejectsMissingTunnelName(t *testing.T) {
 	id, _ := d.CreateService("cloudflared", "tun")
 
 	form := "CF_INGRESS_0_HOST=app.example.com&CF_INGRESS_0_SERVICE=http://localhost:8080"
-	req := httptest.NewRequest("POST", "/service/"+itoa(id), strings.NewReader(form))
+	req := httptest.NewRequest("POST", "/service/"+id, strings.NewReader(form))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
@@ -1317,7 +1318,7 @@ func TestSaveSizeChangeTriggersResize(t *testing.T) {
 
 	// Seed initial config via a plain save (no raw runner, no volume yet) so a
 	// later size change can then be detected as a real change.
-	seed := httptest.NewRequest("POST", "/service/"+itoa(id),
+	seed := httptest.NewRequest("POST", "/service/"+id,
 		strings.NewReader("MINIO_ROOT_USER=admin&MINIO_ROOT_PASSWORD=supersecret&MINIO_HOSTNAME=s3.example.com&MINIO_VOLUME_SIZE=1&MINIO_VOLUME_SIZE_UNIT=G"))
 	seed.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	seedRec := httptest.NewRecorder()
@@ -1329,7 +1330,7 @@ func TestSaveSizeChangeTriggersResize(t *testing.T) {
 	raw := &fakeRawRunner{}
 	// Changing the size (1G -> 2G) on the main save form must drive the
 	// fail-safe resize (volume exists per the fake raw runner).
-	req := httptest.NewRequest("POST", "/service/"+itoa(id),
+	req := httptest.NewRequest("POST", "/service/"+id,
 		strings.NewReader("MINIO_ROOT_USER=admin&MINIO_ROOT_PASSWORD=supersecret&MINIO_HOSTNAME=s3.example.com&MINIO_VOLUME_SIZE=2&MINIO_VOLUME_SIZE_UNIT=G"))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	rec := httptest.NewRecorder()
@@ -1345,7 +1346,7 @@ func TestSaveSizeChangeTriggersResize(t *testing.T) {
 	if items["MINIO_VOLUME_NAME"] == "" {
 		t.Fatal("resize must persist the new volume name")
 	}
-	composeBytes, err := os.ReadFile(filepath.Join(deployDir, itoa(id), "docker-compose.yml"))
+	composeBytes, err := os.ReadFile(filepath.Join(deployDir, id, "docker-compose.yml"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1367,14 +1368,14 @@ func TestSaveUnchangedSizeDoesNotResize(t *testing.T) {
 	deployDir := t.TempDir()
 	id, _ := d.CreateService("minio", "main")
 
-	seed := httptest.NewRequest("POST", "/service/"+itoa(id),
+	seed := httptest.NewRequest("POST", "/service/"+id,
 		strings.NewReader("MINIO_ROOT_USER=admin&MINIO_ROOT_PASSWORD=supersecret&MINIO_HOSTNAME=s3.example.com&MINIO_VOLUME_SIZE=1&MINIO_VOLUME_SIZE_UNIT=G"))
 	seed.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	New(Config{DB: d, Cipher: c, DeployDir: deployDir, Docker: &fakeRunner{}}).ServeHTTP(httptest.NewRecorder(), seed)
 
 	raw := &fakeRawRunner{}
 	// Same size again: should be a plain save, no volume commands.
-	req := httptest.NewRequest("POST", "/service/"+itoa(id),
+	req := httptest.NewRequest("POST", "/service/"+id,
 		strings.NewReader("MINIO_ROOT_USER=admin&MINIO_ROOT_PASSWORD=supersecret&MINIO_HOSTNAME=s3.example.com&MINIO_VOLUME_SIZE=1&MINIO_VOLUME_SIZE_UNIT=G"))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	rec := httptest.NewRecorder()
@@ -1399,7 +1400,7 @@ func TestFirstSavePersistsSizeWithoutResize(t *testing.T) {
 	c, _ := crypto.New("master")
 	id, _ := d.CreateService("minio", "main")
 
-	req := httptest.NewRequest("POST", "/service/"+itoa(id),
+	req := httptest.NewRequest("POST", "/service/"+id,
 		strings.NewReader("MINIO_ROOT_USER=admin&MINIO_ROOT_PASSWORD=supersecret&MINIO_HOSTNAME=s3.example.com&MINIO_VOLUME_SIZE=1&MINIO_VOLUME_SIZE_UNIT=G"))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	rec := httptest.NewRecorder()
@@ -1422,12 +1423,12 @@ func TestShowServicePrefillsSizePicker(t *testing.T) {
 	c, _ := crypto.New("master")
 	id, _ := d.CreateService("minio", "main")
 
-	save := httptest.NewRequest("POST", "/service/"+itoa(id),
+	save := httptest.NewRequest("POST", "/service/"+id,
 		strings.NewReader("MINIO_ROOT_USER=admin&MINIO_ROOT_PASSWORD=supersecret&MINIO_HOSTNAME=s3.example.com&MINIO_VOLUME_SIZE=1&MINIO_VOLUME_SIZE_UNIT=G"))
 	save.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	New(Config{DB: d, Cipher: c, DeployDir: t.TempDir(), Docker: &fakeRunner{}}).ServeHTTP(httptest.NewRecorder(), save)
 
-	get := httptest.NewRequest("GET", "/service/"+itoa(id), nil)
+	get := httptest.NewRequest("GET", "/service/"+id, nil)
 	rec := httptest.NewRecorder()
 	New(Config{DB: d, Cipher: c, DeployDir: t.TempDir(), Docker: &fakeRunner{}}).ServeHTTP(rec, get)
 	if rec.Code != 200 {
@@ -1458,7 +1459,7 @@ func TestSaveRejectsOversizedVolume(t *testing.T) {
 	id, _ := d.CreateService("minio", "main")
 
 	// 999999T (~1000 PiB) exceeds the free space of any real filesystem.
-	req := httptest.NewRequest("POST", "/service/"+itoa(id),
+	req := httptest.NewRequest("POST", "/service/"+id,
 		strings.NewReader("MINIO_ROOT_USER=admin&MINIO_ROOT_PASSWORD=supersecret&MINIO_HOSTNAME=s3.example.com&MINIO_VOLUME_SIZE=999999&MINIO_VOLUME_SIZE_UNIT=T"))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	rec := httptest.NewRecorder()
@@ -1497,12 +1498,12 @@ func TestDeleteServiceTearsDownAndRemovesRows(t *testing.T) {
 	dep := t.TempDir()
 	c, _ := crypto.New("master")
 	h = New(Config{DB: d, Cipher: c, DeployDir: dep, Docker: runner})
-	deployDir := filepath.Join(dep, itoa(id))
+	deployDir := filepath.Join(dep, id)
 	if err := os.MkdirAll(deployDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
 
-	req := httptest.NewRequest("POST", "/service/"+itoa(id)+"/delete", nil)
+	req := httptest.NewRequest("POST", "/service/"+id+"/delete", nil)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusSeeOther {
@@ -1546,7 +1547,7 @@ func TestDeleteMinioRemovesDataVolume(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	req := httptest.NewRequest("POST", "/service/"+itoa(id)+"/delete", nil)
+	req := httptest.NewRequest("POST", "/service/"+id+"/delete", nil)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusSeeOther {
@@ -1575,7 +1576,7 @@ func TestDeleteMailcowRunsDownAndDeletes(t *testing.T) {
 	h := New(Config{DB: d, Cipher: c, DeployDir: deployDir, Docker: runner})
 	id := seedMailcow(t, d, deployDir)
 
-	req := httptest.NewRequest("POST", "/service/"+itoa(id)+"/delete", nil)
+	req := httptest.NewRequest("POST", "/service/"+id+"/delete", nil)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusSeeOther {
@@ -1599,14 +1600,14 @@ func TestDashboardAndServicePageRenderDelete(t *testing.T) {
 	dash := httptest.NewRequest("GET", "/", nil)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, dash)
-	if !strings.Contains(rec.Body.String(), "/service/"+itoa(id)+"/delete") {
+	if !strings.Contains(rec.Body.String(), "/service/"+id+"/delete") {
 		t.Fatalf("dashboard should render the delete form: %s", rec.Body.String())
 	}
-	page := httptest.NewRequest("GET", "/service/"+itoa(id), nil)
+	page := httptest.NewRequest("GET", "/service/"+id, nil)
 	rec = httptest.NewRecorder()
 	h.ServeHTTP(rec, page)
 	body := rec.Body.String()
-	if !strings.Contains(body, "/service/"+itoa(id)+"/delete") {
+	if !strings.Contains(body, "/service/"+id+"/delete") {
 		t.Fatalf("service page should render the delete form: %s", body)
 	}
 	if !strings.Contains(body, "Delete service") {
@@ -1616,11 +1617,22 @@ func TestDashboardAndServicePageRenderDelete(t *testing.T) {
 
 func TestDeleteUnknownServiceNotFound(t *testing.T) {
 	_, h := testServer(t)
-	req := httptest.NewRequest("POST", "/service/999999/delete", nil)
+	req := httptest.NewRequest("POST", "/service/"+uuid.NewString()+"/delete", nil)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("deleting a missing service should be 404, got %d", rec.Code)
+	}
+}
+
+func TestNonUUIDServiceIDNotFound(t *testing.T) {
+	_, h := testServer(t)
+	for _, path := range []string{"/service/999999", "/service/not-a-uuid"} {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest("GET", path, nil))
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("%s should be 404 (id must be a UUID), got %d", path, rec.Code)
+		}
 	}
 }
 
@@ -1647,7 +1659,7 @@ func TestSaveAutostartPersists(t *testing.T) {
 		if checked {
 			form.Set("autostart", "on")
 		}
-		req := httptest.NewRequest("POST", "/service/"+itoa(id), strings.NewReader(form.Encode()))
+		req := httptest.NewRequest("POST", "/service/"+id, strings.NewReader(form.Encode()))
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
@@ -1693,7 +1705,7 @@ func TestServicePageShowsAutostart(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	req := httptest.NewRequest("GET", "/service/"+itoa(id), nil)
+	req := httptest.NewRequest("GET", "/service/"+id, nil)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	body := rec.Body.String()
@@ -1721,9 +1733,9 @@ func TestAutoStartStartsFlaggedServices(t *testing.T) {
 	runner := &fakeRunner{}
 	h := New(Config{DB: d, Cipher: c, DeployDir: deployDir, Docker: runner})
 
-	seedMailcowDir := func(id int64) {
+	seedMailcowDir := func(id string) {
 		t.Helper()
-		dir := filepath.Join(deployDir, itoa(id))
+		dir := filepath.Join(deployDir, id)
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			t.Fatal(err)
 		}
@@ -1763,7 +1775,7 @@ func TestAutoStartStartsFlaggedServices(t *testing.T) {
 	if err := d.SetConfigItems(min, []db.ConfigItem{{Key: "autostart", Value: "true"}}); err != nil {
 		t.Fatal(err)
 	}
-	minDir := filepath.Join(deployDir, itoa(min))
+	minDir := filepath.Join(deployDir, min)
 	if err := os.MkdirAll(minDir, 0o755); err != nil {
 		t.Fatal(err)
 	}

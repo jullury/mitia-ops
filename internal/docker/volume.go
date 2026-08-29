@@ -2,6 +2,7 @@ package docker
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 )
 
@@ -44,6 +45,47 @@ func EnsureVolume(raw RawRunner, volumeName string) error {
 		return nil
 	}
 	return CreateVolume(raw, volumeName)
+}
+
+// RelocateVolume moves a Docker volume's data to a new name without data loss.
+// `docker volume rename` is not available on every Docker install, so the move
+// is done as a copy: the target is recreated empty, the source's contents are
+// archived and restored into it, then the source is removed. Idempotent: when
+// the source is already gone the volume is treated as moved, and a partial or
+// stale target is discarded because the still-present source holds the
+// authoritative data. Callers must take the containing project down first so no
+// container holds either volume open.
+func RelocateVolume(raw RawRunner, from, to string) error {
+	fromExists, err := VolumeExists(raw, from)
+	if err != nil {
+		return err
+	}
+	if !fromExists {
+		return nil
+	}
+	if ok, _ := VolumeExists(raw, to); ok {
+		if err := RemoveVolume(raw, to); err != nil {
+			return fmt.Errorf("drop stale target %s: %w", to, err)
+		}
+	}
+	if err := CreateVolume(raw, to); err != nil {
+		return err
+	}
+	tmp, err := os.MkdirTemp("", "volume-migrate-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(tmp)
+	if err := BackupVolume(raw, from, tmp, VolumeImage); err != nil {
+		return fmt.Errorf("backup %s: %w", from, err)
+	}
+	if err := RestoreVolume(raw, to, tmp, VolumeImage); err != nil {
+		return fmt.Errorf("restore into %s: %w", to, err)
+	}
+	if err := RemoveVolume(raw, from); err != nil {
+		return fmt.Errorf("remove %s: %w", from, err)
+	}
+	return nil
 }
 
 // BackupVolume archives the current contents of volume into backupDir as

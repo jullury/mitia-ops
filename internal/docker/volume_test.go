@@ -8,9 +8,10 @@ import (
 )
 
 type recordingRunner struct {
-	compose []string   // last compose invocation
-	rawSeq  [][]string // all raw invocations
-	exist   bool       // volume existence seen by VolumeExists
+	compose []string        // last compose invocation
+	rawSeq  [][]string      // all raw invocations
+	exist   bool            // volume existence seen by VolumeExists
+	real    map[string]bool // optional per-volume existence, wins over exist
 }
 
 func (r *recordingRunner) Run(dir string, args ...string) (string, error) {
@@ -22,6 +23,12 @@ func (r *recordingRunner) RunRaw(args ...string) (string, error) {
 	r.rawSeq = append(r.rawSeq, args)
 	// satisfy VolumeExists-backed flows
 	if len(args) == 3 && args[0] == "volume" && args[1] == "inspect" {
+		if r.real != nil {
+			if !r.real[args[2]] {
+				return "", &exitError{}
+			}
+			return "ok", nil
+		}
 		if !r.exist {
 			return "", &exitError{}
 		}
@@ -114,6 +121,80 @@ func TestParseSize(t *testing.T) {
 	}
 	if _, err := ParseSize("abc"); err == nil {
 		t.Fatal("expected error for invalid size")
+	}
+}
+
+func isVolumeCmd(args []string, verb, name string) bool {
+	if len(args) < 3 || args[0] != "volume" || args[1] != verb {
+		return false
+	}
+	return sub(args[len(args)-1], name)
+}
+
+func TestRelocateVolumeFullMove(t *testing.T) {
+	r := &recordingRunner{real: map[string]bool{"4_minio_data": true}}
+	if err := RelocateVolume(r, "4_minio_data", "abcd-1234_minio_data"); err != nil {
+		t.Fatal(err)
+	}
+	// The source is removed last, proving the copy completed first.
+	last := r.rawSeq[len(r.rawSeq)-1]
+	if !isVolumeCmd(last, "rm", "4_minio_data") {
+		t.Fatalf("expected final source removal, got %v", last)
+	}
+	// The data must be archived and restored, never just renamed.
+	var backup, restore bool
+	for _, args := range r.rawSeq {
+		if anyContains(args, "czf") {
+			backup = true
+		}
+		if anyContains(args, "xzf") {
+			restore = true
+		}
+	}
+	if !backup || !restore {
+		t.Fatalf("expected backup+restore runs, got %v", r.rawSeq)
+	}
+	// Target created exactly once (it did not exist, so must not be dropped).
+	creates := 0
+	for _, args := range r.rawSeq {
+		if isVolumeCmd(args, "create", "abcd-1234_minio_data") {
+			creates++
+		}
+		if isVolumeCmd(args, "rm", "abcd-1234_minio_data") {
+			creates = 99 // flag unexpected target removal
+		}
+	}
+	if creates != 1 {
+		t.Fatalf("expected one target create and no target removal, got %d", creates)
+	}
+}
+
+func TestRelocateVolumeDropsStaleTarget(t *testing.T) {
+	r := &recordingRunner{real: map[string]bool{"4_minio_data": true, "abcd-1234_minio_data": true}}
+	if err := RelocateVolume(r, "4_minio_data", "abcd-1234_minio_data"); err != nil {
+		t.Fatal(err)
+	}
+	// A stale target (empty volume created by an interrupted run) must be
+	// dropped before the recreate, since the source holds the real data.
+	dropped := false
+	for _, args := range r.rawSeq {
+		if isVolumeCmd(args, "rm", "abcd-1234_minio_data") {
+			dropped = true
+		}
+	}
+	if !dropped {
+		t.Fatalf("expected stale target removal, got %v", r.rawSeq)
+	}
+}
+
+func TestRelocateVolumeNoopWhenSourceGone(t *testing.T) {
+	r := &recordingRunner{real: map[string]bool{}}
+	if err := RelocateVolume(r, "4_minio_data", "abcd-1234_minio_data"); err != nil {
+		t.Fatal(err)
+	}
+	// Source already moved: only the existence check runs, nothing is created.
+	if len(r.rawSeq) != 1 || !isVolumeCmd(r.rawSeq[0], "inspect", "4_minio_data") {
+		t.Fatalf("expected a single inspection, got %v", r.rawSeq)
 	}
 }
 

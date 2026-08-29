@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -12,8 +13,127 @@ import (
 	"github.com/jullury/mitia-ops/internal/crypto"
 	"github.com/jullury/mitia-ops/internal/db"
 	"github.com/jullury/mitia-ops/internal/docker"
+	"github.com/jullury/mitia-ops/internal/render"
+	"github.com/jullury/mitia-ops/internal/services"
 	"github.com/jullury/mitia-ops/internal/web"
 )
+
+// resizeVolumeNames mirrors web.resizeVolumeNames: kinds whose named volume is
+// project-scoped and thus embedded in the rendered compose as an external
+// volume name that follows the deploy dir (i.e. the service id).
+var resizeVolumeNames = map[services.Kind]string{
+	services.KindMinio: "minio_data",
+}
+
+// regenerateCompose re-renders the deployment file for a service whose compose
+// pins a project-scoped external volume name (e.g. the minio compose mounts
+// `name: <id>_minio_data`). The compose on disk predates the id change and
+// would still mount the old name, so it is derived again from stored config
+// with the volume reference pointing at the migrated (relocated) volume.
+func regenerateCompose(d *db.DB, dir, id string) error {
+	svc, err := d.ServiceByID(id)
+	if err != nil {
+		return err
+	}
+	def, ok := services.Get(services.Kind(svc.Kind))
+	if !ok {
+		return fmt.Errorf("unknown kind %q", svc.Kind)
+	}
+	namedVolume, ok := resizeVolumeNames[def.Kind]
+	if !ok {
+		return nil // this kind's compose never embeds the id
+	}
+	values, err := d.ConfigItems(id)
+	if err != nil {
+		return err
+	}
+	name := values["MINIO_VOLUME_NAME"]
+	if name == "" {
+		name = docker.VolumeName(dir, namedVolume)
+	}
+	values["MINIO_VOLUME_NAME"] = name
+	res, err := render.BuildRenderResult(def.Kind, values)
+	if err != nil {
+		return err
+	}
+	return render.WriteCompose(dir, res)
+}
+
+// migrateLegacyServices upgrades an install whose service ids were sequential
+// integers to UUIDs. It runs the full migration: first the DB half — remap
+// services/config_items to fresh UUIDs and record the old->new pairing in
+// migrated_ids (a no-op on a schema that already uses TEXT ids) — then the
+// on-disk half: bring the stack down, rename the deploy directory to the UUID,
+// and relocate every project-scoped Docker volume (which embeds the id, e.g.
+// "4_minio_data", "4_mysql-vol-1") so application data survives. Each step
+// skips gracefully when the source is already gone, so a crash mid-way just
+// picks up where it left off on the next boot. The migrated_ids rows are the
+// resume marker and are cleared only once every volume has been relocated.
+func migrateLegacyServices(d *db.DB, deployDir string, runner docker.Runner, raw docker.RawRunner) error {
+	if _, err := d.MigrateLegacyIDs(); err != nil {
+		return fmt.Errorf("migration: remap service ids: %w", err)
+	}
+	pending, err := d.PendingMigrations()
+	if err != nil {
+		return fmt.Errorf("migration: read pending id remaps: %w", err)
+	}
+	if len(pending) == 0 {
+		return nil
+	}
+	allDone := true
+	for oldID, newID := range pending {
+		oldDir := filepath.Join(deployDir, oldID)
+		newDir := filepath.Join(deployDir, newID)
+
+		// Take both paths down first. A fresh run only ever has the old path
+		// up, but a crash may have brought a half-renamed project up under the
+		// new one; containers must release their volumes before any is replaced.
+		// Volumes themselves hold the data and are untouched by `down`.
+		for _, dir := range []string{oldDir, newDir} {
+			if _, err := os.Stat(filepath.Join(dir, "docker-compose.yml")); err != nil {
+				continue
+			}
+			if _, err := runner.Run(dir, "down"); err != nil {
+				log.Printf("migration: compose down %s: %v", dir, err)
+			}
+		}
+		if _, err := os.Stat(oldDir); err == nil {
+			if err := os.Rename(oldDir, newDir); err != nil {
+				log.Printf("migration: rename %s -> %s: %v", oldDir, newDir, err)
+			}
+		}
+
+		// Re-derive the rendered deployment file so any id-embedding external
+		// volume reference (minio's compose) points at the relocated volume.
+		if err := regenerateCompose(d, newDir, newID); err != nil {
+			log.Printf("migration: regenerate compose for %s: %v", newID, err)
+			allDone = false
+		}
+
+		// Relocate every volume carrying the old id prefix (name scheme:
+		// <dir base>_<volume>). `docker volume rename` is not universally
+		// available, so the data is copied rather than renamed.
+		out, _ := raw.RunRaw("volume", "ls", "-q", "--filter", "name=^"+oldID+"_")
+		for _, vol := range strings.Fields(out) {
+			if !strings.HasPrefix(vol, oldID+"_") {
+				continue
+			}
+			target := newID + strings.TrimPrefix(vol, oldID)
+			if err := docker.RelocateVolume(raw, vol, target); err != nil {
+				log.Printf("migration: relocate volume %s -> %s: %v", vol, target, err)
+				allDone = false
+			}
+		}
+	}
+	// Keep the migrated_ids marker until every volume has actually moved, so a
+	// failure (e.g. a volume still in use) is retried on the next boot instead
+	// of silently leaving data stranded under the old name.
+	if !allDone {
+		log.Printf("migration: incomplete, %d old id(s) still pending", len(pending))
+		return nil
+	}
+	return d.CompleteMigrations()
+}
 
 func loadDotEnv(path string) {
 	f, err := os.Open(path)
@@ -73,6 +193,10 @@ func main() {
 	}
 
 	cli := docker.NewCLI()
+
+	if err := migrateLegacyServices(d, deployDir, cli, cli); err != nil {
+		log.Fatal(err)
+	}
 
 	// cloudflared runs through a cloudflare/cloudflared container (never a host
 	// install), so the host only needs docker. Its state — the login certificate

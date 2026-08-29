@@ -1,9 +1,15 @@
 package db
 
 import (
+	"database/sql"
 	"path/filepath"
+	"regexp"
 	"testing"
+
+	_ "modernc.org/sqlite"
 )
+
+var uuidRe = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
 func TestServiceCRUD(t *testing.T) {
 	d, err := Open(filepath.Join(t.TempDir(), "test.db"))
@@ -16,8 +22,8 @@ func TestServiceCRUD(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if id <= 0 {
-		t.Fatalf("expected positive id, got %d", id)
+	if !uuidRe.MatchString(id) {
+		t.Fatalf("expected a UUID id, got %q", id)
 	}
 
 	if err := d.SetConfigItems(id, []ConfigItem{
@@ -110,5 +116,99 @@ func TestDeleteConfigItems(t *testing.T) {
 	items, _ = d.ConfigItems(id)
 	if items["CF_INGRESS_0_HOST"] != "a.example.com" {
 		t.Fatalf("delete must be scoped to the service, got %+v", items)
+	}
+}
+
+func TestMigrateLegacyIDs(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy.db")
+
+	// Build a pre-UUID database by hand (services.id INTEGER PRIMARY KEY).
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range []string{
+		`CREATE TABLE services (id INTEGER PRIMARY KEY, kind TEXT NOT NULL, name TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1);`,
+		`CREATE TABLE config_items (id INTEGER PRIMARY KEY, service_id INTEGER NOT NULL REFERENCES services(id) ON DELETE CASCADE, key TEXT NOT NULL, value TEXT NOT NULL, UNIQUE(service_id, key));`,
+		`INSERT INTO services (id, kind, name) VALUES (1, 'cloudflared', 'tun'), (2, 'minio', 'main');`,
+		`INSERT INTO config_items (service_id, key, value) VALUES (2, 'MINIO_ROOT_USER', 'admin');`,
+		`INSERT INTO config_items (service_id, key, value) VALUES (2, 'MINIO_VOLUME_NAME', '2_minio_data');`,
+	} {
+		if _, err := raw.Exec(q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	raw.Close()
+
+	d, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+
+	migrated, err := d.MigrateLegacyIDs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !migrated {
+		t.Fatal("expected a legacy schema migration to run")
+	}
+	// Legacy integer ids must no longer resolve.
+	if _, err := d.ServiceByID("2"); err == nil {
+		t.Fatal("legacy id 2 should not survive the migration")
+	}
+
+	// The migrated services carry UUIDs, and config items followed their
+	// service across the remap.
+	pending, err := d.PendingMigrations()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 2 {
+		t.Fatalf("expected 2 pending id remaps, got %d", len(pending))
+	}
+	svcs, err := d.ListServices()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(svcs) != 2 {
+		t.Fatalf("expected 2 services after migration, got %d", len(svcs))
+	}
+	var minioID string
+	for _, svc := range svcs {
+		if !uuidRe.MatchString(svc.ID) {
+			t.Fatalf("service id should be a UUID, got %q", svc.ID)
+		}
+		if svc.Kind == "minio" {
+			minioID = svc.ID
+		}
+	}
+	if pending["2"] != minioID {
+		t.Fatalf("remap for legacy id 2 = %q, want %q", pending["2"], minioID)
+	}
+	if items, _ := d.ConfigItems(minioID); items["MINIO_ROOT_USER"] != "admin" {
+		t.Fatalf("config items must follow the service to its new id, got %+v", items)
+	}
+	// Values embedding the legacy id (project-scoped volume names) are
+	// rewritten to the new prefix and keep matching the migrated volumes.
+	if items, _ := d.ConfigItems(minioID); items["MINIO_VOLUME_NAME"] != minioID+"_minio_data" {
+		t.Fatalf("volume-name values must be rewritten to the new id, got %q", items["MINIO_VOLUME_NAME"])
+	}
+
+	// Idempotent: a second run is a no-op.
+	again, err := d.MigrateLegacyIDs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again {
+		t.Fatal("second migration should be a no-op")
+	}
+
+	// Completing the bookkeeping leaves nothing pending.
+	if err := d.CompleteMigrations(); err != nil {
+		t.Fatal(err)
+	}
+	if p, _ := d.PendingMigrations(); len(p) != 0 {
+		t.Fatalf("expected no pending migrations after completion, got %v", p)
 	}
 }

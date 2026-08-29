@@ -1,10 +1,12 @@
 package db
 
 import (
+	"context"
 	"database/sql"
 	_ "embed"
 	"fmt"
 
+	"github.com/google/uuid"
 	_ "modernc.org/sqlite"
 )
 
@@ -16,7 +18,7 @@ type DB struct {
 }
 
 type Service struct {
-	ID      int64
+	ID      string
 	Kind    string
 	Name    string
 	Enabled bool
@@ -48,16 +50,18 @@ func (d *DB) ForeignKeysEnabled() bool {
 	return v == 1
 }
 
-func (d *DB) CreateService(kind, name string) (int64, error) {
-	res, err := d.db.Exec("INSERT INTO services (kind, name) VALUES (?, ?)", kind, name)
-	if err != nil {
-		return 0, err
+func (d *DB) CreateService(kind, name string) (string, error) {
+	id := uuid.NewString()
+	if _, err := d.db.Exec("INSERT INTO services (id, kind, name) VALUES (?, ?, ?)", id, kind, name); err != nil {
+		return "", err
 	}
-	return res.LastInsertId()
+	return id, nil
 }
 
 func (d *DB) ListServices() ([]Service, error) {
-	rows, err := d.db.Query("SELECT id, kind, name, enabled FROM services ORDER BY id")
+	// UUIDs don't sort like the legacy integer ids did, so preserve insertion
+	// order via rowid.
+	rows, err := d.db.Query("SELECT id, kind, name, enabled FROM services ORDER BY rowid")
 	if err != nil {
 		return nil, err
 	}
@@ -75,7 +79,7 @@ func (d *DB) ListServices() ([]Service, error) {
 	return out, rows.Err()
 }
 
-func (d *DB) ServiceByID(id int64) (*Service, error) {
+func (d *DB) ServiceByID(id string) (*Service, error) {
 	var s Service
 	var en int
 	err := d.db.QueryRow("SELECT id, kind, name, enabled FROM services WHERE id = ?", id).Scan(&s.ID, &s.Kind, &s.Name, &en)
@@ -88,7 +92,7 @@ func (d *DB) ServiceByID(id int64) (*Service, error) {
 
 // DeleteService removes a service and (via the ON DELETE CASCADE foreign key)
 // its config items, in a single transaction so no orphaned rows remain.
-func (d *DB) DeleteService(id int64) error {
+func (d *DB) DeleteService(id string) error {
 	tx, err := d.db.Begin()
 	if err != nil {
 		return err
@@ -103,7 +107,7 @@ func (d *DB) DeleteService(id int64) error {
 	return tx.Commit()
 }
 
-func (d *DB) SetConfigItems(serviceID int64, items []ConfigItem) error {
+func (d *DB) SetConfigItems(serviceID string, items []ConfigItem) error {
 	tx, err := d.db.Begin()
 	if err != nil {
 		return err
@@ -124,7 +128,7 @@ func (d *DB) SetConfigItems(serviceID int64, items []ConfigItem) error {
 // DeleteConfigItems removes the given keys for a service. Keys that don't exist
 // are ignored; an empty key set is a no-op. Used to drop stale FieldList rows
 // (e.g. old CF_INGRESS_n_* cells) after a re-save shrinks the list.
-func (d *DB) DeleteConfigItems(serviceID int64, keys []string) error {
+func (d *DB) DeleteConfigItems(serviceID string, keys []string) error {
 	if len(keys) == 0 {
 		return nil
 	}
@@ -141,7 +145,7 @@ func (d *DB) DeleteConfigItems(serviceID int64, keys []string) error {
 	return tx.Commit()
 }
 
-func (d *DB) ConfigItems(serviceID int64) (map[string]string, error) {
+func (d *DB) ConfigItems(serviceID string) (map[string]string, error) {
 	rows, err := d.db.Query("SELECT key, value FROM config_items WHERE service_id = ?", serviceID)
 	if err != nil {
 		return nil, err
@@ -156,4 +160,184 @@ func (d *DB) ConfigItems(serviceID int64) (map[string]string, error) {
 		out[k] = v
 	}
 	return out, rows.Err()
+}
+
+// legacySchema reports whether services.id is still the old INTEGER primary
+// key (i.e. the DB predates UUID service ids) rather than the current TEXT.
+func (d *DB) legacySchema() (bool, error) {
+	rows, err := d.db.Query("PRAGMA table_info(services)")
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid, notnull, pk int
+		var name, typ string
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &typ, &notnull, &dflt, &pk); err != nil {
+			return false, err
+		}
+		if name == "id" && typ != "TEXT" {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
+}
+
+// MigrateLegacyIDs upgrades a pre-UUID database: every service gets a fresh
+// UUID, config_items are remapped, and the old<->new pairing is recorded in
+// migrated_ids so the caller can rename the matching deploy directories and
+// Docker volumes (resumable across restarts). It is a no-op on a schema that
+// already uses TEXT ids. The rebuild runs in a single transaction with foreign
+// keys off (the new config_items is built before the old tables are dropped).
+func (d *DB) MigrateLegacyIDs() (bool, error) {
+	legacy, err := d.legacySchema()
+	if err != nil {
+		return false, err
+	}
+	if !legacy {
+		return false, nil
+	}
+	// Load the legacy rows and mint a UUID per id so the remap is stable.
+	rows, err := d.db.Query("SELECT id, kind, name, enabled FROM services ORDER BY id")
+	if err != nil {
+		return false, err
+	}
+	type oldRow struct {
+		id, kind, name string
+		enabled        int
+	}
+	var olds []oldRow
+	for rows.Next() {
+		var r oldRow
+		if err := rows.Scan(&r.id, &r.kind, &r.name, &r.enabled); err != nil {
+			rows.Close()
+			return false, err
+		}
+		olds = append(olds, r)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+
+	// PRAGMA foreign_keys is a per-connection setting and a no-op inside a
+	// transaction, so pin the whole rebuild to one dedicated connection and
+	// toggle it around the rewrite (re-enabled unconditionally on the way out).
+	conn, err := d.db.Conn(context.Background())
+	if err != nil {
+		return false, err
+	}
+	defer conn.Close()
+	defer conn.ExecContext(context.Background(), "PRAGMA foreign_keys = ON")
+	if _, err := conn.ExecContext(context.Background(), "PRAGMA foreign_keys = OFF"); err != nil {
+		return false, err
+	}
+	tx, err := conn.BeginTx(context.Background(), nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(`CREATE TABLE services_new (
+		id      TEXT PRIMARY KEY,
+		kind    TEXT NOT NULL,
+		name    TEXT NOT NULL,
+		enabled INTEGER NOT NULL DEFAULT 1
+	)`); err != nil {
+		return false, err
+	}
+	if _, err := tx.Exec("CREATE TEMP TABLE idmap (old_id TEXT PRIMARY KEY, new_id TEXT NOT NULL)"); err != nil {
+		return false, err
+	}
+	for _, r := range olds {
+		uid := uuid.NewString()
+		if _, err := tx.Exec("INSERT INTO idmap (old_id, new_id) VALUES (?, ?)", r.id, uid); err != nil {
+			return false, err
+		}
+		if _, err := tx.Exec("INSERT INTO services_new (id, kind, name, enabled) VALUES (?, ?, ?, ?)", uid, r.kind, r.name, r.enabled); err != nil {
+			return false, err
+		}
+	}
+
+	if _, err := tx.Exec(`CREATE TABLE config_items_new (
+		id         INTEGER PRIMARY KEY,
+		service_id TEXT NOT NULL REFERENCES services(id) ON DELETE CASCADE,
+		key        TEXT NOT NULL,
+		value      TEXT NOT NULL,
+		UNIQUE(service_id, key)
+	)`); err != nil {
+		return false, err
+	}
+	if _, err := tx.Exec(`INSERT INTO config_items_new (id, service_id, key, value)
+		SELECT ci.id, m.new_id, ci.key, ci.value
+		FROM config_items ci JOIN idmap m ON m.old_id = ci.service_id`); err != nil {
+		return false, err
+	}
+
+	// Rename over the old tables (config_items is dropped first: it references
+	// services) and record the pending disk/docker migration.
+	if _, err := tx.Exec("DROP TABLE config_items"); err != nil {
+		return false, err
+	}
+	if _, err := tx.Exec("DROP TABLE services"); err != nil {
+		return false, err
+	}
+	if _, err := tx.Exec("ALTER TABLE config_items_new RENAME TO config_items"); err != nil {
+		return false, err
+	}
+	if _, err := tx.Exec("ALTER TABLE services_new RENAME TO services"); err != nil {
+		return false, err
+	}
+	// Some config values embed the legacy id in a project-scoped volume name
+	// (e.g. MINIO_VOLUME_NAME=3_minio_data after a resize). Rewrite those value
+	// prefixes so the compose keeps pointing at the surviving volume.
+	idMap, err := tx.Query("SELECT old_id, new_id FROM idmap")
+	if err != nil {
+		return false, err
+	}
+	for idMap.Next() {
+		var oldID, newID string
+		if err := idMap.Scan(&oldID, &newID); err != nil {
+			idMap.Close()
+			return false, err
+		}
+		if _, err := tx.Exec("UPDATE config_items SET value = ? || substr(value, length(?) + 1) WHERE value LIKE ? || '_%'", newID, oldID, oldID); err != nil {
+			idMap.Close()
+			return false, err
+		}
+	}
+	idMap.Close()
+	if _, err := tx.Exec("INSERT INTO migrated_ids (old_id, new_id) SELECT old_id, new_id FROM idmap"); err != nil {
+		return false, err
+	}
+
+	return true, tx.Commit()
+}
+
+// PendingMigrations returns the recorded legacy id -> UUID pairs whose deploy
+// directories and Docker volumes still await renaming. Rows are deleted by
+// CompleteMigrations once the on-disk work is done.
+func (d *DB) PendingMigrations() (map[string]string, error) {
+	rows, err := d.db.Query("SELECT old_id, new_id FROM migrated_ids")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]string{}
+	for rows.Next() {
+		var o, n string
+		if err := rows.Scan(&o, &n); err != nil {
+			return nil, err
+		}
+		out[o] = n
+	}
+	return out, rows.Err()
+}
+
+// CompleteMigrations clears the pending migration bookkeeping once the deploy
+// directories and volumes have been renamed to their UUIDs.
+func (d *DB) CompleteMigrations() error {
+	_, err := d.db.Exec("DELETE FROM migrated_ids")
+	return err
 }
