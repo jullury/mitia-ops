@@ -80,13 +80,13 @@ one with `make build` first, that one is installed instead.
 **Install a released binary (one-liner, no Go toolchain needed):**
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/jullury/mitia-ops/main/scripts/install.sh \
-  | sudo bash
+curl -fsSL https://raw.githubusercontent.com/jullury/mitia-ops/refs/heads/main/scripts/install.sh | sudo sh
 ```
 
 This fetches `install.sh`, runs it as root, downloads the latest pre-built
 binary for your OS/arch from the GitHub release, and installs it as a systemd
-service.
+service. You will be prompted for your password (by `sudo`) before installation
+starts.
 
 **Or clone the repo and run `install.sh` directly:**
 
