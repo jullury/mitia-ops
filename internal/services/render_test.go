@@ -5,6 +5,53 @@ import (
 	"testing"
 )
 
+func TestPostgresRender(t *testing.T) {
+	def, _ := Get(KindPostgres)
+	res, err := def.Render(map[string]string{
+		"POSTGRES_DB":          "app",
+		"POSTGRES_USER":        "admin",
+		"POSTGRES_PASSWORD":    "supersecret",
+		"POSTGRES_PORT":        "5433",
+		"POSTGRES_VOLUME_SIZE": "100G",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(res.ComposeYAML, "postgres:16-alpine") {
+		t.Fatalf("expected postgres image: %q", res.ComposeYAML)
+	}
+	if !strings.Contains(res.ComposeYAML, `- "5433:5432"`) {
+		t.Fatalf("expected configured host port: %q", res.ComposeYAML)
+	}
+	for _, want := range []string{"POSTGRES_DB: app", "POSTGRES_USER: admin", "POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}"} {
+		if !strings.Contains(res.ComposeYAML, want) {
+			t.Fatalf("compose missing %q: %q", want, res.ComposeYAML)
+		}
+	}
+	if !strings.Contains(res.ComposeYAML, "pg_data:/var/lib/postgresql/data") {
+		t.Fatalf("expected data volume mount: %q", res.ComposeYAML)
+	}
+	if !strings.Contains(res.DotEnv, "POSTGRES_PASSWORD=supersecret") {
+		t.Fatalf("expected secret in dotenv: %q", res.DotEnv)
+	}
+	if !strings.Contains(res.DotEnv, "POSTGRES_VOLUME_SIZE=100G") {
+		t.Fatalf("expected volume size in dotenv: %q", res.DotEnv)
+	}
+}
+
+func TestPostgresRenderDefaults(t *testing.T) {
+	def, _ := Get(KindPostgres)
+	res, err := def.Render(map[string]string{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`- "5432:5432"`, "POSTGRES_DB: postgres", "POSTGRES_USER: postgres"} {
+		if !strings.Contains(res.ComposeYAML, want) {
+			t.Fatalf("default missing %q: %q", want, res.ComposeYAML)
+		}
+	}
+}
+
 func TestMinioRender(t *testing.T) {
 	def, _ := Get(KindMinio)
 	res, err := def.Render(map[string]string{

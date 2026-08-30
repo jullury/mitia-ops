@@ -10,6 +10,7 @@ const (
 	KindMailcow     Kind = "mailcow"
 	KindCaddy       Kind = "caddy"
 	KindCloudflared Kind = "cloudflared"
+	KindPostgres    Kind = "postgres"
 )
 
 type Kind string

@@ -548,7 +548,7 @@ func (s *server) saveService(w http.ResponseWriter, r *http.Request) {
 	if namedVolume, ok := resizeVolumeNames[def.Kind]; ok {
 		newSize := values["MINIO_VOLUME_SIZE"]
 		if newSize != "" && newSize != existing["MINIO_VOLUME_SIZE"] {
-			if _, _, msg, ok := s.sizePreflight(dir, newSize); !ok {
+			if _, _, msg, ok := s.sizePreflight(dir, id, newSize); !ok {
 				s.renderService(w, r, id, msg, true)
 				return
 			}
@@ -663,7 +663,7 @@ func (s *server) serviceAction(w http.ResponseWriter, r *http.Request) {
 		values, _, _ := decryptValues(s.cfg.Cipher, def, items, true)
 		s.injectVolumeName(dir, id, def.Kind, values)
 		if prep, ok := prepareFns[def.Kind]; ok {
-			if err := prep(s, dir, values); err != nil {
+			if err := prep(s, id, dir, values); err != nil {
 				q := url.Values{}
 				q.Set("err", "1")
 				q.Set("msg", err.Error())
@@ -724,7 +724,7 @@ func (s *server) upService(id string) error {
 	values, _, _ := decryptValues(s.cfg.Cipher, def, items, true)
 	s.injectVolumeName(dir, id, def.Kind, values)
 	if prep, ok := prepareFns[def.Kind]; ok {
-		if err := prep(s, dir, values); err != nil {
+		if err := prep(s, id, dir, values); err != nil {
 			return &servicePrepareError{err}
 		}
 	}
@@ -744,7 +744,7 @@ func (s *server) upService(id string) error {
 			}
 			// Reject a configured size the disk can't fit before Docker tries
 			// (and fails) to create the volume.
-			if _, _, msg, ok := s.sizePreflight(dir, size); !ok {
+			if _, _, msg, ok := s.sizePreflight(dir, id, size); !ok {
 				return fmt.Errorf("volume preflight: %s", msg)
 			}
 			if err := docker.EnsureVolume(s.cfg.DockerRaw, name); err != nil {
@@ -800,7 +800,7 @@ func (s *server) startMailcowUp(id string) {
 		items, _ := s.cfg.DB.ConfigItems(id)
 		values, _, _ := decryptValues(s.cfg.Cipher, def, items, true)
 
-		if err := prepareMailcow(s, dir, values); err != nil {
+		if err := prepareMailcow(s, id, dir, values); err != nil {
 			s.jobs.set(id, JobError, "", err.Error())
 			return
 		}
@@ -911,12 +911,31 @@ var resizeVolumeNames = map[services.Kind]string{
 	services.KindMinio: "minio_data",
 }
 
-// prepareFns maps kinds needing launch-time file materialization (driving the
-// cloudflared CLI: create/reuse the tunnel, then write the credentials and
-// config.yml the compose mounts) to the step run right before `up`|`restart`.
-var prepareFns = map[services.Kind]func(s *server, dir string, values map[string]string) error{
+// prepareFns maps kinds needing a launch-time step run right before
+// `up`|`restart`: materializing files the compose mounts (cloudflared's
+// config, mailcow's conf) or guarding the launch (postgres's volume-size
+// preflight). id lets a guard exclude the service's own declaration from the
+// cross-service free-space check.
+var prepareFns = map[services.Kind]func(s *server, id, dir string, values map[string]string) error{
 	services.KindCloudflared: prepareCloudflared,
 	services.KindMailcow:     prepareMailcow,
+	services.KindPostgres:    preparePostgres,
+}
+
+// preparePostgres enforces the volume-size guard at launch: when a
+// POSTGRES_VOLUME_SIZE is configured, the launch fails fast if the disk can't
+// hold it together with every other service's declared volume size, before
+// compose creates the volume on first init. The size is advisory (local
+// volumes cannot enforce one) — it guards initiation only.
+func preparePostgres(s *server, id, dir string, values map[string]string) error {
+	size := strings.TrimSpace(values["POSTGRES_VOLUME_SIZE"])
+	if size == "" {
+		return nil
+	}
+	if _, _, msg, ok := s.sizePreflight(dir, id, size); !ok {
+		return errors.New(msg)
+	}
+	return nil
 }
 
 // prepareCloudflared resolves the tunnel for a cloudflared service at launch:
@@ -924,7 +943,7 @@ var prepareFns = map[services.Kind]func(s *server, dir string, values map[string
 // `cloudflared tunnel login` if the cert is missing), creates/reuses the named
 // tunnel, and writes creds.json and config.yml (resolved tunnel id + the saved
 // ingress rules) into the deploy dir before compose mounts them.
-func prepareCloudflared(s *server, dir string, values map[string]string) error {
+func prepareCloudflared(s *server, svcID, dir string, values map[string]string) error {
 	cli := s.cfg.Cloudflared
 	if cli == nil {
 		return fmt.Errorf("cloudflared container runner is not configured")
@@ -988,7 +1007,7 @@ func prepareCloudflared(s *server, dir string, values map[string]string) error {
 // and creates the `.env` -> `mailcow.conf` symlink mailcow's compose requires.
 // The official stack's own docker-compose.yml is what `up`/`down`/`restart`
 // act on; port-mapping edits apply when `up` recreates the containers.
-func prepareMailcow(s *server, dir string, values map[string]string) error {
+func prepareMailcow(s *server, id, dir string, values map[string]string) error {
 	if strings.TrimSpace(values["MAILCOW_HOSTNAME"]) == "" {
 		return fmt.Errorf("mail server hostname (FQDN) is required")
 	}
@@ -1251,10 +1270,13 @@ func (s *server) injectVolumeName(dir string, id string, kind services.Kind, val
 }
 
 // sizePreflight validates a requested volume size string against the free space
-// on dir's filesystem. It returns the resized byte count and ok=true when it
-// fits, or a non-200 http status plus a human-readable message otherwise (400
-// for an unparseable size, 507 when the disk lacks room).
-func (s *server) sizePreflight(dir, newSize string) (int64, int, string, bool) {
+// on dir's filesystem, counting every OTHER service's declared volume size: all
+// sized services (minio, postgres, …) claim the same disk, so one service's
+// guard must fail when the others have already declared sizes it can't host.
+// It returns the resized byte count and ok=true when everything fits, or a
+// non-200 http status plus a human-readable message otherwise (400 for an
+// unparseable size, 507 when the disk lacks room).
+func (s *server) sizePreflight(dir, id, newSize string) (int64, int, string, bool) {
 	newBytes, err := docker.ParseSize(newSize)
 	if err != nil {
 		return 0, http.StatusBadRequest, "invalid volume size: " + err.Error(), false
@@ -1263,15 +1285,53 @@ func (s *server) sizePreflight(dir, newSize string) (int64, int, string, bool) {
 	if err != nil {
 		return 0, http.StatusInternalServerError, err.Error(), false
 	}
+	demand := newBytes + s.declaredVolumeSizes(id)
 	buffer := int64(1) << 30 // 1 GiB headroom
-	if newBytes/20 > buffer {
-		buffer = newBytes / 20 // 5% of the new size
+	if demand/20 > buffer {
+		buffer = demand / 20 // 5% of the total demand
 	}
-	if free < newBytes+buffer {
+	if free < demand+buffer {
 		return 0, http.StatusInsufficientStorage,
-			"not enough free disk space: need " + prettyBytes(newBytes+buffer) + ", have " + prettyBytes(free), false
+			"not enough free disk space: need " + prettyBytes(demand+buffer) + ", have " + prettyBytes(free), false
 	}
 	return newBytes, 0, "", true
+}
+
+// declaredVolumeSizes sums the configured FieldSize value of every service
+// except id (whose size is being replaced by the value sizePreflight checks).
+// Size keys are derived from the service registry, so new sizes services plug
+// into the guard automatically.
+func (s *server) declaredVolumeSizes(excludeID string) (sum int64) {
+	sizeKey := map[services.Kind]string{}
+	for _, def := range services.All() {
+		for _, f := range def.Fields {
+			if f.Type == services.FieldSize {
+				sizeKey[def.Kind] = f.Key
+				break
+			}
+		}
+	}
+	svcs, err := s.cfg.DB.ListServices()
+	if err != nil {
+		return 0
+	}
+	for _, svc := range svcs {
+		if svc.ID == excludeID {
+			continue
+		}
+		key, ok := sizeKey[services.Kind(svc.Kind)]
+		if !ok {
+			continue
+		}
+		items, err := s.cfg.DB.ConfigItems(svc.ID)
+		if err != nil {
+			continue
+		}
+		if b, err := docker.ParseSize(items[key]); err == nil {
+			sum += b
+		}
+	}
+	return sum
 }
 
 func (s *server) doResize(w http.ResponseWriter, r *http.Request, id string, def services.Definition, dir, namedVolume string, items []db.ConfigItem, values map[string]string) {
@@ -1282,7 +1342,7 @@ func (s *server) doResize(w http.ResponseWriter, r *http.Request, id string, def
 	newSize := values["MINIO_VOLUME_SIZE"]
 	// Pre-flight free-space check: the resize must fit the full new volume plus
 	// a buffer, so it fails before stopping the service or touching any data.
-	if _, status, msg, ok := s.sizePreflight(dir, newSize); !ok {
+	if _, status, msg, ok := s.sizePreflight(dir, id, newSize); !ok {
 		http.Error(w, msg, status)
 		return
 	}

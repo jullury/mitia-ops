@@ -169,7 +169,18 @@ dashboard behind cloudflared, which the app can drive for you (see below).
   upper bound used by the free-space preflight at launch and resize: Docker's
   local volume driver cannot enforce a hard size on persistent storage (the
   `size` mount option only works for RAM-backed tmpfs), so the volume itself is a
-  plain local volume.
+  plain local volume. The preflight counts **every service's** declared volume
+  size, so minio, postgres and any future sized service can't collectively claim
+  more than the disk holds.
+- **postgres** — PostgreSQL (via the official `postgres:16-alpine` image). On
+  first init it creates one default database (`POSTGRES_DB`, default
+  `postgres`) owned by `POSTGRES_USER`; data lives in a persistent `pg_data`
+  volume. Default host port is `5432`. Extra users and databases are created
+  freely from inside the running server via `psql` — the app intentionally
+  manages just the single default database. Like minio it has a *Volume size
+  limit* picker, but it guards initiation only: a launch (start / restart /
+  start-on-boot) is refused up front when the disk can't hold the configured
+  size together with every other service's declared volume size.
 - **caddy** — reverse proxy + TLS. **Not fully working yet (WIP).**
 - **mailcow** — mail server. On first **Start** the app clones the official
   [`mailcow/mailcow-dockerized`](https://github.com/mailcow/mailcow-dockerized)

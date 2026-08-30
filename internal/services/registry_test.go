@@ -11,7 +11,7 @@ func TestRegistryContainsServices(t *testing.T) {
 	for _, d := range defs {
 		byKind[d.Kind] = d
 	}
-	for _, k := range []Kind{KindMinio, KindMailcow, KindCaddy, KindCloudflared} {
+	for _, k := range []Kind{KindMinio, KindMailcow, KindCaddy, KindCloudflared, KindPostgres} {
 		if _, ok := byKind[k]; !ok {
 			t.Fatalf("missing definition for %s", k)
 		}
@@ -128,6 +128,36 @@ func TestMailcowDefinition(t *testing.T) {
 	}
 	if res.DotEnv != "" || res.ComposeYAML != "" {
 		t.Fatalf("mailcow render must be empty (config is written by the launch prepare step), got %+v", res)
+	}
+}
+
+func TestPostgresDefinition(t *testing.T) {
+	def, ok := Get(KindPostgres)
+	if !ok {
+		t.Fatal("postgres definition missing")
+	}
+	if def.ReadOnly {
+		t.Fatal("postgres must be lifecycle-controlled")
+	}
+	keys := map[string]bool{}
+	var size *Field
+	for i := range def.Fields {
+		f := &def.Fields[i]
+		keys[f.Key] = true
+		if f.Key == "POSTGRES_PASSWORD" && f.Type != FieldSecret {
+			t.Fatalf("POSTGRES_PASSWORD must be a secret field, got %+v", f)
+		}
+		if f.Key == "POSTGRES_VOLUME_SIZE" {
+			size = f
+		}
+	}
+	for _, want := range []string{"POSTGRES_DB", "POSTGRES_USER", "POSTGRES_PASSWORD", "POSTGRES_PORT", "POSTGRES_VOLUME_SIZE"} {
+		if !keys[want] {
+			t.Fatalf("postgres missing field %s (have %v)", want, keys)
+		}
+	}
+	if size == nil || size.Type != FieldSize || len(size.Units) == 0 {
+		t.Fatalf("postgres must declare a FieldSize volume (initiation guard), got %+v", size)
 	}
 }
 

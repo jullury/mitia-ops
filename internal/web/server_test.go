@@ -518,7 +518,7 @@ func TestMailcowAdoptsExistingConfSecrets(t *testing.T) {
 	}
 
 	s := &server{cfg: Config{DB: d, Cipher: c, DeployDir: deployDir}}
-	if err := prepareMailcow(s, dir, map[string]string{
+	if err := prepareMailcow(s, "", dir, map[string]string{
 		"MAILCOW_HOSTNAME":  "mail.example.com",
 		"MAILCOW_HTTP_PORT": "8080",
 	}); err != nil {
@@ -579,7 +579,7 @@ func TestMailcowStoredSecretCorruptionErrors(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := &server{cfg: Config{DB: d, Cipher: c, DeployDir: deployDir}}
-	err = prepareMailcow(s, filepath.Join(deployDir, id), map[string]string{"MAILCOW_HOSTNAME": "mail.example.com"})
+	err = prepareMailcow(s, "", filepath.Join(deployDir, id), map[string]string{"MAILCOW_HOSTNAME": "mail.example.com"})
 	if err == nil {
 		t.Fatal("undecryptable stored credentials must abort the launch, got nil")
 	}
@@ -1561,6 +1561,89 @@ func TestDeleteMinioRemovesDataVolume(t *testing.T) {
 	// DB row gone
 	if _, err := d.ServiceByID(id); err == nil {
 		t.Fatal("service row should be deleted")
+	}
+}
+
+// TestSizePreflightAwareOfOtherServices guards the free-space preflight
+// counting EVERY service's declared volume size: minio + postgres (and future
+// sized kinds) collectively claim the same disk, so a preflight for one must
+// fail when another declares a size the disk can't hold — while still ignoring
+// the service's own past declaration.
+func TestSizePreflightAwareOfOtherServices(t *testing.T) {
+	d, err := db.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { d.Close() })
+	c, _ := crypto.New("master")
+	minioID, err := d.CreateService("minio", "data")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pgID, err := d.CreateService("postgres", "data2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	put := func(id, key, val string) {
+		t.Helper()
+		if err := d.SetConfigItems(id, []db.ConfigItem{{Key: key, Value: val}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	put(minioID, "MINIO_VOLUME_SIZE", "999999T")
+	put(pgID, "POSTGRES_VOLUME_SIZE", "999999T")
+	s := &server{cfg: Config{DB: d, Cipher: c, DeployDir: t.TempDir()}}
+
+	// A tiny new size for minio must still fail: postgres's declared volume
+	// size counts against the same disk.
+	if _, _, msg, ok := s.sizePreflight(t.TempDir(), minioID, "1M"); ok {
+		t.Fatalf("minio preflight must account for postgres's declared size, passed: %s", msg)
+	}
+	// With postgres's declaration dropped, and minio excluded from its own
+	// check, a small minio volume fits.
+	put(pgID, "POSTGRES_VOLUME_SIZE", "")
+	if _, _, msg, ok := s.sizePreflight(t.TempDir(), minioID, "1M"); !ok {
+		t.Fatalf("without other declarations a small volume must pass: %s", msg)
+	}
+}
+
+// TestPostgresUpSizeGuard covers the postgres "initiation guard": a declared
+// volume size that the disk cannot hold blocks `up` (before any volume is
+// created), while a small declared size launches normally.
+func TestPostgresUpSizeGuard(t *testing.T) {
+	d, h := testServer(t)
+	id, err := d.CreateService("postgres", "db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	save := func(form string) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest("POST", "/service/"+id, strings.NewReader(form))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+	rec := save("POSTGRES_DB=app&POSTGRES_USER=admin&POSTGRES_PASSWORD=supersecret&POSTGRES_VOLUME_SIZE=999999&POSTGRES_VOLUME_SIZE_UNIT=T")
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("save status %d: %s", rec.Code, rec.Body.String())
+	}
+	up := func() string {
+		t.Helper()
+		req := httptest.NewRequest("POST", "/service/"+id+"/action?op=up", nil)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec.Header().Get("Location")
+	}
+	if loc := up(); !strings.Contains(loc, "err=1") {
+		t.Fatalf("up with an oversized declaration must hit the size guard, redirect = %q", loc)
+	}
+	rec = save("POSTGRES_DB=app&POSTGRES_USER=admin&POSTGRES_PASSWORD=supersecret&POSTGRES_VOLUME_SIZE=1&POSTGRES_VOLUME_SIZE_UNIT=M")
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("save status %d", rec.Code)
+	}
+	if loc := up(); loc != "/?msg=up" {
+		t.Fatalf("up with a small declared size must not be blocked, redirect = %q", loc)
 	}
 }
 
