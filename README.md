@@ -181,6 +181,17 @@ dashboard behind cloudflared, which the app can drive for you (see below).
   limit* picker, but it guards initiation only: a launch (start / restart /
   start-on-boot) is refused up front when the disk can't hold the configured
   size together with every other service's declared volume size.
+- **vault** — HashiCorp Vault secrets management (via the official
+  `hashicorp/vault` image), configured for production-style single-node use: a
+  file-storage backend on a persistent data volume and a TCP listener on the
+  configured *Host port* (default `8200`), driven by an app-generated
+  `vault.hcl`. Vault starts **sealed** — the app generates unseal keys + root
+  token on first init (5 shares / threshold 3) and persists them encrypted in
+  its store, then the dashboard's **Unseal** action (or the `vault` CLI)
+  breaks the seal. Set a *Hostname* (optional) for the advertised `api_addr`.
+  Like postgres, a *Volume size limit* guards launch only. Note a deleted
+  service's data volume is gone, so unseal keys from the app store no longer
+  match — delete, don't reuse.
 - **caddy** — reverse proxy + TLS. **Not fully working yet (WIP).**
 - **mailcow** — mail server. On first **Start** the app clones the official
   [`mailcow/mailcow-dockerized`](https://github.com/mailcow/mailcow-dockerized)

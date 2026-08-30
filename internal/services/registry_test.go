@@ -11,7 +11,7 @@ func TestRegistryContainsServices(t *testing.T) {
 	for _, d := range defs {
 		byKind[d.Kind] = d
 	}
-	for _, k := range []Kind{KindMinio, KindMailcow, KindCaddy, KindCloudflared, KindPostgres} {
+	for _, k := range []Kind{KindMinio, KindMailcow, KindCaddy, KindCloudflared, KindPostgres, KindVault} {
 		if _, ok := byKind[k]; !ok {
 			t.Fatalf("missing definition for %s", k)
 		}

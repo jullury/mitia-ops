@@ -1,7 +1,9 @@
 package web
 
 import (
+	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -15,6 +17,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jullury/mitia-ops/internal/crypto"
 	"github.com/jullury/mitia-ops/internal/db"
+	"github.com/jullury/mitia-ops/internal/services"
 )
 
 type fakeRunner struct {
@@ -1890,5 +1893,174 @@ func TestAutoStartStartsFlaggedServices(t *testing.T) {
 	}
 	if upCount != 2 {
 		t.Fatalf("AutoStart must up exactly the flagged services (mailcow + minio), got %v", got)
+	}
+}
+
+// fakeVaultAPI stubs the minimal Vault HTTP API surface the app drives:
+// sys/init (GET state + PUT to initialize) and sys/unseal. Proxied to the test
+// server so the app's unseal action can run end-to-end against it.
+type fakeVaultAPI struct {
+	initialized bool
+	unsealed    bool
+	keys        []string
+	rootToken   string
+	threshold   int
+	unsealCalls int
+}
+
+func (f *fakeVaultAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	switch r.URL.Path {
+	case "/v1/sys/init":
+		switch r.Method {
+		case http.MethodGet:
+			w.Write([]byte(`{"initialized":` + boolJSON(f.initialized) + `}`))
+		case http.MethodPut:
+			if f.initialized {
+				http.Error(w, `{"errors":["already initialized"]}`, 400)
+				return
+			}
+			f.initialized = true
+			var body struct {
+				Shares    int `json:"secret_shares"`
+				Threshold int `json:"secret_threshold"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			f.threshold = body.Threshold
+			if f.threshold == 0 {
+				f.threshold = 3
+			}
+			w.Write([]byte(`{"keys":["k1","k2","k3","k4","k5"],"root_token":"root-tok","secret_shares":5,"secret_threshold":` + fmt.Sprintf("%d", body.Threshold) + `}`))
+		}
+	case "/v1/sys/unseal":
+		f.unsealCalls++
+		if f.unsealCalls >= f.threshold {
+			f.unsealed = true
+		}
+		w.Write([]byte(`{"sealed":` + boolJSON(!f.unsealed) + `,"threshold":` + fmt.Sprintf("%d", f.threshold) + `}`))
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+func boolJSON(b bool) string {
+	if b {
+		return "true"
+	}
+	return "false"
+}
+
+func TestVaultUnsealInitializesAndUnseals(t *testing.T) {
+	api := &fakeVaultAPI{}
+	srv := httptest.NewServer(api)
+	defer srv.Close()
+	port := strings.TrimPrefix(srv.URL, "http://127.0.0.1:")
+
+	d, h := testServer(t)
+	id, err := d.CreateService("vault", "vault")
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest("POST", "/service/"+id, strings.NewReader(url.Values{
+		"VAULT_PORT":             {port},
+		"VAULT_VOLUME_SIZE":      {"1"},
+		"VAULT_VOLUME_SIZE_UNIT": {"M"},
+	}.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("save status %d: %s", rec.Code, rec.Body.String())
+	}
+
+	req = httptest.NewRequest("POST", "/service/"+id+"/action?op=unseal", nil)
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	loc := rec.Header().Get("Location")
+	if !strings.Contains(loc, "msg=vault-unsealed") {
+		t.Fatalf("unseal redirect should report success, got %q body=%s", loc, rec.Body.String())
+	}
+	if !api.initialized {
+		t.Fatal("Vault must have been initialized")
+	}
+	if !api.unsealed {
+		t.Fatal("Vault must have been unsealed")
+	}
+	// key + root token must be persisted encrypted in the config store.
+	items, _ := d.ConfigItems(id)
+	enc := items[services.VaultSecretUnsealKey1]
+	if enc == "" {
+		t.Fatal("expected unseal key persisted encrypted")
+	}
+	cd, _ := crypto.New("master") // same master key → can decrypt
+	if plain, err := cd.Decrypt(enc); err != nil || plain != "k1" {
+		t.Fatalf("unseal key 1 mismatch: plain=%q err=%v", plain, err)
+	}
+}
+
+func TestVaultUnsealRejectedForNonVaultKind(t *testing.T) {
+	d, h := testServer(t)
+	id, err := d.CreateService("minio", "minio")
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest("POST", "/service/"+id+"/action?op=unseal", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("non-vault unseal must be 400, got %d", rec.Code)
+	}
+}
+
+func TestVaultUpSizeGuard(t *testing.T) {
+	d, h := testServer(t)
+	id, err := d.CreateService("vault", "vault")
+	if err != nil {
+		t.Fatal(err)
+	}
+	save := func(size, unit string) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest("POST", "/service/"+id, strings.NewReader(url.Values{
+			"VAULT_PORT":             {"8200"},
+			"VAULT_VOLUME_SIZE":      {size},
+			"VAULT_VOLUME_SIZE_UNIT": {unit},
+		}.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+	up := func() string {
+		t.Helper()
+		req := httptest.NewRequest("POST", "/service/"+id+"/action?op=up", nil)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec.Header().Get("Location")
+	}
+	if rec := save("999999", "T"); rec.Code != http.StatusSeeOther {
+		t.Fatalf("save status %d", rec.Code)
+	}
+	if loc := up(); !strings.Contains(loc, "err=1") {
+		t.Fatalf("up with an oversized declaration must hit the size guard, redirect=%q", loc)
+	}
+	if rec := save("1", "M"); rec.Code != http.StatusSeeOther {
+		t.Fatalf("save status %d", rec.Code)
+	}
+	if loc := up(); loc != "/?msg=up" {
+		t.Fatalf("up with a small declared size must not be blocked, redirect=%q", loc)
+	}
+}
+
+func TestDashboardRendersVaultUnsealButton(t *testing.T) {
+	d, h := testServer(t)
+	id, err := d.CreateService("vault", "vault")
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest("GET", "/", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	body := rec.Body.String()
+	if !strings.Contains(body, "/service/"+id+"/action?op=unseal") {
+		t.Fatalf("dashboard should render an Unseal form for vault: %s", body)
 	}
 }

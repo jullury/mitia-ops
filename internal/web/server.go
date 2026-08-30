@@ -2,9 +2,11 @@ package web
 
 import (
 	"embed"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"html/template"
+	"io"
 	"log"
 	"net/http"
 	"net/url"
@@ -14,6 +16,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jullury/mitia-ops/internal/crypto"
@@ -206,8 +209,10 @@ var actionMsg = map[string]string{
 }
 
 var serviceMsg = map[string]string{
-	"saved":   "Settings saved",
-	"resized": "Volume resized — data preserved",
+	"saved":              "Settings saved",
+	"resized":            "Volume resized — data preserved",
+	"vault-unsealed":     "Vault unsealed — it is ready to use",
+	"vault-still-sealed": "Vault is still sealed (needs more unseal keys); initialize/unseal it via the UI or the vault CLI",
 }
 
 type dashRow struct {
@@ -603,10 +608,6 @@ func (s *server) serviceAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	op := r.URL.Query().Get("op")
-	if op != "up" && op != "down" && op != "restart" {
-		http.Error(w, "unknown op", 400)
-		return
-	}
 	dir := s.deployDir(id)
 
 	svc, err := s.cfg.DB.ServiceByID(id)
@@ -631,6 +632,48 @@ func (s *server) serviceAction(w http.ResponseWriter, r *http.Request) {
 	if def.Kind == services.KindMailcow && op == "up" {
 		s.startMailcowUp(id)
 		http.Redirect(w, r, "/service/"+id+"?deploying=1", http.StatusSeeOther)
+		return
+	}
+
+	// Vault's "unseal" action isn't a compose lifecycle op: it talks to the
+	// running Vault's HTTP API to (re)initialize it if needed and break the
+	// seal with the stored unseal keys. The container must already be up.
+	if op == "unseal" {
+		if def.Kind != services.KindVault {
+			http.Error(w, "unknown op", 400)
+			return
+		}
+		items, err := s.cfg.DB.ConfigItems(id)
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		values, _, _ := decryptValues(s.cfg.Cipher, def, items, true)
+		if err := s.ensureVaultInitialized(id, values); err != nil {
+			q := url.Values{}
+			q.Set("err", "1")
+			q.Set("msg", err.Error())
+			http.Redirect(w, r, "/service/"+id+"?"+q.Encode(), http.StatusSeeOther)
+			return
+		}
+		sealed, err := s.vaultUnseal(id, vaultPort(values))
+		if err != nil {
+			q := url.Values{}
+			q.Set("err", "1")
+			q.Set("msg", "unseal failed: "+err.Error())
+			http.Redirect(w, r, "/service/"+id+"?"+q.Encode(), http.StatusSeeOther)
+			return
+		}
+		msg := "vault-unsealed"
+		if sealed {
+			msg = "vault-still-sealed"
+		}
+		http.Redirect(w, r, "/service/"+id+"?msg="+msg, http.StatusSeeOther)
+		return
+	}
+
+	if op != "up" && op != "down" && op != "restart" {
+		http.Error(w, "unknown op", 400)
 		return
 	}
 
@@ -920,6 +963,7 @@ var prepareFns = map[services.Kind]func(s *server, id, dir string, values map[st
 	services.KindCloudflared: prepareCloudflared,
 	services.KindMailcow:     prepareMailcow,
 	services.KindPostgres:    preparePostgres,
+	services.KindVault:       prepareVault,
 }
 
 // preparePostgres enforces the volume-size guard at launch: when a
@@ -936,6 +980,172 @@ func preparePostgres(s *server, id, dir string, values map[string]string) error 
 		return errors.New(msg)
 	}
 	return nil
+}
+
+// prepareVault materializes the vault.hcl the compose mounts, and enforces the
+// volume-size guard at launch (see preparePostgres). The config file is written
+// fresh on every launch so hostname/port edits are picked up; it is a plain
+// file (no .env interpolation needed).
+func prepareVault(s *server, id, dir string, values map[string]string) error {
+	size := strings.TrimSpace(values["VAULT_VOLUME_SIZE"])
+	if size != "" {
+		if _, _, msg, ok := s.sizePreflight(dir, id, size); !ok {
+			return errors.New(msg)
+		}
+	}
+	content := services.VaultConfig(values)
+	return os.WriteFile(filepath.Join(dir, "vault.hcl"), []byte(content), 0o644)
+}
+
+// vaultPort resolves the host port Vault is published on, from the decryptable
+// config values (defaults to 8200).
+func vaultPort(values map[string]string) string {
+	port := strings.TrimSpace(values["VAULT_PORT"])
+	if port == "" {
+		port = "8200"
+	}
+	return port
+}
+
+// ensureVaultInitialized asks a running Vault for its init state and, when it
+// is uninitialized, initializes it (5 unseal shares, threshold 3), persisting
+// the returned unseal keys and root token encrypted in the config store so the
+// app (and the operator) can unseal it and so a deploy-dir recreate keeps the
+// same keys. It is a no-op once initialized.
+func (s *server) ensureVaultInitialized(id string, values map[string]string) error {
+	port := vaultPort(values)
+	base := "http://127.0.0.1:" + port + "/v1/sys/init"
+	state, err := vaultRequest("GET", base, "", "")
+	if err != nil {
+		return fmt.Errorf("cannot reach Vault at :%s (is it up?): %w", port, err)
+	}
+	var initResp struct {
+		Initialized bool `json:"initialized"`
+	}
+	if err := json.Unmarshal(state, &initResp); err != nil {
+		return err
+	}
+	if initResp.Initialized {
+		return nil
+	}
+	body, err := vaultRequest("PUT", base, "", `{"secret_shares":5,"secret_threshold":3}`)
+	if err != nil {
+		return fmt.Errorf("initializing Vault: %w", err)
+	}
+	var initR struct {
+		Keys      []string `json:"keys"`
+		RootToken string   `json:"root_token"`
+	}
+	if err := json.Unmarshal(body, &initR); err != nil {
+		return err
+	}
+	if len(initR.Keys) == 0 || initR.RootToken == "" {
+		return fmt.Errorf("Vault init returned no keys/root token")
+	}
+	secrets := map[string]string{}
+	for i, key := range services.VaultSecretKeys() {
+		if i < len(initR.Keys) {
+			secrets[key] = initR.Keys[i]
+		}
+	}
+	secrets[services.VaultSecretRootToken] = initR.RootToken
+	persist := make([]db.ConfigItem, 0, len(services.VaultSecretKeys()))
+	for _, key := range services.VaultSecretKeys() {
+		enc, err := s.cfg.Cipher.Encrypt(secrets[key])
+		if err != nil {
+			return err
+		}
+		persist = append(persist, db.ConfigItem{Key: key, Value: enc})
+	}
+	if err := s.cfg.DB.SetConfigItems(id, persist); err != nil {
+		return err
+	}
+	return nil
+}
+
+// loadVaultSecrets decrypts the persisted unseal keys back out of the config
+// store. It returns just the keys; Vault needs a threshold of them to unseal.
+func (s *server) loadVaultSecrets(id string) (keys []string, err error) {
+	items, err := s.cfg.DB.ConfigItems(id)
+	if err != nil {
+		return nil, err
+	}
+	for _, key := range services.VaultSecretKeys() {
+		if key == services.VaultSecretRootToken {
+			continue
+		}
+		enc := items[key]
+		if enc == "" {
+			continue
+		}
+		plain, err := s.cfg.Cipher.Decrypt(enc)
+		if err != nil {
+			return nil, fmt.Errorf("stored Vault %s cannot be decrypted (%v): restore the original master key, or delete this service and its data volume", key, err)
+		}
+		keys = append(keys, plain)
+	}
+	return keys, nil
+}
+
+// vaultUnseal drives Vault's sys/unseal with each persisted key (up to the
+// threshold) until the seal is broken. It returns whether Vault is still
+// sealed afterwards.
+func (s *server) vaultUnseal(id, port string) (sealed bool, err error) {
+	keys, err := s.loadVaultSecrets(id)
+	if err != nil {
+		return false, err
+	}
+	if len(keys) == 0 {
+		return false, fmt.Errorf("no unseal keys stored for this service; init it first (start the service and press Unseal again)")
+	}
+	for _, key := range keys {
+		payload, _ := json.Marshal(map[string]string{"key": key})
+		body, err := vaultRequest("PUT", "http://127.0.0.1:"+port+"/v1/sys/unseal", "", string(payload))
+		if err != nil {
+			return false, err
+		}
+		var r struct {
+			Sealed bool `json:"sealed"`
+		}
+		if err := json.Unmarshal(body, &r); err != nil {
+			return false, err
+		}
+		if !r.Sealed {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+// vaultRequest performs a raw HTTP request against the Vault API. A body is
+// sent on PUT; empty for GET. It returns the raw response body.
+func vaultRequest(method, urlStr, token, body string) ([]byte, error) {
+	var rd io.Reader
+	if body != "" {
+		rd = strings.NewReader(body)
+	}
+	req, err := http.NewRequest(method, urlStr, rd)
+	if err != nil {
+		return nil, err
+	}
+	if token != "" {
+		req.Header.Set("X-Vault-Token", token)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	out, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("Vault API %s -> %d %s", urlStr, resp.StatusCode, strings.TrimSpace(string(out)))
+	}
+	return out, nil
 }
 
 // prepareCloudflared resolves the tunnel for a cloudflared service at launch:

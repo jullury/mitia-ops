@@ -52,6 +52,14 @@
         {{ if .ConfigURL }}
           <a class="btn" href="{{ .ConfigURL }}" target="_blank" rel="noopener">Open config</a>
         {{ end }}
+        {{ if eq .Kind "vault" }}
+        <form method="post" action="/service/{{ .ID }}/action?op=unseal"
+              onsubmit="return confirm('Unseal {{ .Name }}? Initializes it if needed, then breaks the seal with the stored unseal keys. The service must be running.')">
+          <button class="btn muted icon-btn" type="submit" title="Unseal Vault" aria-label="Unseal {{ .Name }}">
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+          </button>
+        </form>
+        {{ end }}
         <form method="post" action="/service/{{ .ID }}/action?op=up">
           <button class="btn primary icon-btn" type="submit" title="Start service" aria-label="Start {{ .Name }}">
             <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polygon points="5 3 19 12 5 21 5 3"/></svg>

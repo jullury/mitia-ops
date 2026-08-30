@@ -11,6 +11,7 @@ const (
 	KindCaddy       Kind = "caddy"
 	KindCloudflared Kind = "cloudflared"
 	KindPostgres    Kind = "postgres"
+	KindVault       Kind = "vault"
 )
 
 type Kind string

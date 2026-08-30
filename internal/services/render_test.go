@@ -189,6 +189,83 @@ func TestCloudflaredConfig(t *testing.T) {
 	}
 }
 
+func TestVaultRender(t *testing.T) {
+	def, _ := Get(KindVault)
+	res, err := def.Render(map[string]string{
+		"VAULT_HOSTNAME":    "vault.example.com",
+		"VAULT_PORT":        "8201",
+		"VAULT_VOLUME_SIZE": "100G",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(res.ComposeYAML, "hashicorp/vault") {
+		t.Fatalf("expected vault image: %q", res.ComposeYAML)
+	}
+	if !strings.Contains(res.ComposeYAML, "command: server") {
+		t.Fatalf("expected server command: %q", res.ComposeYAML)
+	}
+	// The vault image entrypoint auto-loads the whole /vault/config dir (adding
+	// its own -config=…), so passing -config in compose makes Vault parse the
+	// config twice -> two listeners on 8200 -> "bind: address already in use".
+	if strings.Contains(res.ComposeYAML, "-config") {
+		t.Fatalf("must not pass -config in compose (entrypoint loads /vault/config): %q", res.ComposeYAML)
+	}
+	if strings.Contains(res.ComposeYAML, " -dev") || strings.Contains(res.ComposeYAML, "server -dev") {
+		t.Fatalf("must not run dev mode: %q", res.ComposeYAML)
+	}
+	if !strings.Contains(res.ComposeYAML, `- "8201:8200"`) {
+		t.Fatalf("expected configured host port: %q", res.ComposeYAML)
+	}
+	if !strings.Contains(res.ComposeYAML, "IPC_LOCK") {
+		t.Fatalf("expected IPC_LOCK capability: %q", res.ComposeYAML)
+	}
+	if !strings.Contains(res.ComposeYAML, "vault.hcl:/vault/config/vault.hcl:ro") {
+		t.Fatalf("expected config mount: %q", res.ComposeYAML)
+	}
+	if !strings.Contains(res.ComposeYAML, "vault_data:/vault/file") {
+		t.Fatalf("expected data volume mount: %q", res.ComposeYAML)
+	}
+	for _, want := range []string{"VAULT_HOSTNAME=vault.example.com", "VAULT_PORT=8201", "VAULT_VOLUME_SIZE=100G"} {
+		if !strings.Contains(res.DotEnv, want) {
+			t.Fatalf("missing dotenv %q: %q", want, res.DotEnv)
+		}
+	}
+}
+
+func TestVaultConfig(t *testing.T) {
+	cfg := VaultConfig(map[string]string{"VAULT_HOSTNAME": "vault.example.com", "VAULT_PORT": "8201"})
+	for _, want := range []string{
+		`storage "file" {`,
+		`path = "/vault/file"`,
+		"tls_disable = 1",
+		"disable_mlock = true",
+		`api_addr = "http://vault.example.com:8201"`,
+		"ui = true",
+	} {
+		if !strings.Contains(cfg, want) {
+			t.Fatalf("vault.hcl missing %q:\n%s", want, cfg)
+		}
+	}
+	if strings.Contains(cfg, "-dev") {
+		t.Fatalf("vault.hcl must not enable dev mode:\n%s", cfg)
+	}
+	// loopback fallback when no hostname is set
+	if fallback := VaultConfig(map[string]string{}); !strings.Contains(fallback, "http://127.0.0.1:8200") {
+		t.Fatalf("expected loopback api_addr fallback:\n%s", fallback)
+	}
+}
+
+func TestVaultConfigURL(t *testing.T) {
+	def, _ := Get(KindVault)
+	if got := def.ConfigURL(map[string]string{"VAULT_PORT": "8201"}); got != "http://localhost:8201/ui" {
+		t.Fatalf("config url: got %q", got)
+	}
+	if got := def.ConfigURL(map[string]string{}); got != "http://localhost:8200/ui" {
+		t.Fatalf("config url default: got %q", got)
+	}
+}
+
 func TestListRows(t *testing.T) {
 	columns := []ListColumn{{Suffix: "HOST"}, {Suffix: "SERVICE"}}
 	rows := ListRows(map[string]string{
