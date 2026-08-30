@@ -36,6 +36,13 @@ type Config struct {
 	Docker      docker.Runner
 	DockerRaw   docker.RawRunner
 	Cloudflared CloudflaredCLI // optional: drives tunnel creation at launch for cloudflared services
+	// BackupDir is the snapshot root directory (MITIAOPS_BACKUPS). When empty,
+	// backups are disabled for every service.
+	BackupDir string
+	// BackupSchedule is the global default backup cadence: "" | "off" | "daily"
+	// | "weekly" | "@hourly". Per-service overrides win when "inherit" or a
+	// concrete value is chosen.
+	BackupSchedule string
 }
 
 // CloudflaredCLI is the subset of the cloudflared binary the app drives when
@@ -79,6 +86,9 @@ func New(cfg Config) *App {
 	mux.HandleFunc("POST /service/{id}/action", s.serviceAction)
 	mux.HandleFunc("POST /service/{id}/delete", s.deleteService)
 	mux.HandleFunc("GET /service/{id}/status", s.serviceStatus)
+	mux.HandleFunc("POST /service/{id}/backup", s.backupNow)
+	mux.HandleFunc("GET /service/{id}/backup/{bid}/download", s.downloadBackup)
+	mux.HandleFunc("POST /service/{id}/backup/{bid}/restore", s.restoreBackup)
 	return &App{mux: mux, s: s}
 }
 
@@ -103,6 +113,15 @@ func (a *App) AutoStart() {
 	a.s.AutoStart()
 }
 
+// BackupSchedulerOnce runs one scheduling sweep immediately (used as a test
+// seam and by StartBackupScheduler's startup catch-up). Returns the number of
+// backups taken.
+func (a *App) BackupSchedulerOnce() int { return a.s.backupSchedulerOnce() }
+
+// StartBackupScheduler launches the periodic backup sweep in the background.
+// Call once at startup; see server.StartBackupScheduler.
+func (a *App) StartBackupScheduler(interval time.Duration) { a.s.StartBackupScheduler(interval) }
+
 type server struct {
 	cfg      Config
 	dashTmpl *template.Template
@@ -116,10 +135,11 @@ type server struct {
 type JobState string
 
 const (
-	JobCloning JobState = "cloning"
-	JobPulling JobState = "pulling"
-	JobRunning JobState = "running"
-	JobError   JobState = "error"
+	JobCloning    JobState = "cloning"
+	JobPulling    JobState = "pulling"
+	JobBackingUp  JobState = "backing-up"
+	JobRunning    JobState = "running"
+	JobError      JobState = "error"
 )
 
 // job is one in-flight background deployment for a single service.
@@ -211,6 +231,8 @@ var actionMsg = map[string]string{
 var serviceMsg = map[string]string{
 	"saved":              "Settings saved",
 	"resized":            "Volume resized — data preserved",
+	"backing-up":         "Backup started — the snapshot will appear below when finished",
+	"restored":           "Restored from snapshot",
 	"vault-unsealed":     "Vault unsealed — it is ready to use",
 	"vault-still-sealed": "Vault is still sealed (needs more unseal keys); initialize/unseal it via the UI or the vault CLI",
 }
@@ -383,6 +405,7 @@ func (s *server) renderService(w http.ResponseWriter, r *http.Request, id string
 			jobMsg = j.msg
 		}
 	}
+	backups, _ := s.cfg.DB.ListBackups(id)
 	s.svcTmpl.ExecuteTemplate(w, "base.html", svcData{
 		Def:       def,
 		Service:   svc,
@@ -396,6 +419,10 @@ func (s *server) renderService(w http.ResponseWriter, r *http.Request, id string
 		Autostart: items[autostartKey] == "true",
 		JobState:  jobState,
 		JobMsg:    jobMsg,
+		Backups:   backups,
+		BackupConfigured: s.cfg.BackupDir != "",
+		BackupSchedule:   items[backupScheduleKey],
+		BackupSchedules:  []string{"inherit", "off", "@hourly", "daily", "weekly"},
 	})
 }
 
@@ -412,6 +439,12 @@ type svcData struct {
 	Autostart bool   // true if the service is flagged to start on boot
 	JobState  string // background deployment state, or "" when none
 	JobMsg    string // human-readable progress message for the job
+	// Backups is this service's saved snapshots, newest first. BackupConfigured
+	// reports whether the app was started with a backup directory.
+	Backups          []db.Backup
+	BackupConfigured bool
+	BackupSchedule   string // per-service schedule selector value
+	BackupSchedules  []string
 }
 
 // hasSizeField reports whether a definition declares a FieldSize field (i.e. a
@@ -542,6 +575,13 @@ func (s *server) saveService(w http.ResponseWriter, r *http.Request) {
 		autostart = "true"
 	}
 	items = append(items, db.ConfigItem{Key: autostartKey, Value: autostart})
+	// The per-service backup schedule is likewise universal: inherit (default)
+	// follows the global MITIAOPS_BACKUP_SCHEDULE, otherwise an explicit value.
+	schedule := strings.TrimSpace(r.FormValue(backupScheduleKey))
+	if schedule == "" {
+		schedule = "inherit"
+	}
+	items = append(items, db.ConfigItem{Key: backupScheduleKey, Value: schedule})
 	dir := s.deployDir(id)
 
 	// A change to a resizeable data volume's size is preflighted for free space
@@ -926,6 +966,20 @@ func (s *server) deleteService(w http.ResponseWriter, r *http.Request) {
 	if err := docker.RemoveDeployDir(dir, "", s.cfg.DockerRaw); err != nil {
 		http.Error(w, err.Error(), 500)
 		return
+	}
+
+	// Remove this service's backup snapshot files and metadata. The rows
+	// cascade away with the service row; the files live outside the DB and are
+	// removed here best-effort (a leftover is harmless but leaks disk).
+	if s.cfg.BackupDir != "" {
+		if rows, err := s.cfg.DB.ListBackups(id); err == nil {
+			for _, b := range rows {
+				_ = os.Remove(filepath.Join(s.cfg.BackupDir, id, b.Filename))
+			}
+		}
+		if err := docker.RemoveDeployDir(filepath.Join(s.cfg.BackupDir, id), "", s.cfg.DockerRaw); err != nil {
+			// best-effort; dir may not exist or hold nothing
+		}
 	}
 
 	if err := s.cfg.DB.DeleteService(id); err != nil {

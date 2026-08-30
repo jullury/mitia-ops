@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/jullury/mitia-ops/internal/cloudflared"
 	"github.com/jullury/mitia-ops/internal/crypto"
@@ -187,6 +188,17 @@ func main() {
 		deployDir = "deployments"
 	}
 
+	backupDir := os.Getenv("MITIAOPS_BACKUPS")
+	if backupDir == "" {
+		backupDir = filepath.Join(dataDir, "backups")
+	}
+	_ = os.MkdirAll(backupDir, 0o755)
+
+	backupSchedule := os.Getenv("MITIAOPS_BACKUP_SCHEDULE")
+	if backupSchedule == "" {
+		backupSchedule = "off"
+	}
+
 	addr := os.Getenv("MITIAOPS_ADDR")
 	if addr == "" {
 		addr = ":8080"
@@ -219,16 +231,21 @@ func main() {
 		log.Fatal(err)
 	}
 	app := web.New(web.Config{
-		DB:          d,
-		Cipher:      cipher,
-		DeployDir:   deployDir,
-		Docker:      cli,
-		DockerRaw:   cli,
-		Cloudflared: cf,
+		DB:             d,
+		Cipher:         cipher,
+		DeployDir:      deployDir,
+		Docker:         cli,
+		DockerRaw:      cli,
+		Cloudflared:    cf,
+		BackupDir:      backupDir,
+		BackupSchedule: backupSchedule,
 	})
 	// Bring back every service flagged "start on boot" (runs `up` per service in
 	// the background), so an app restart / host reboot restores the stack.
 	app.AutoStart()
+	// Scheduled backups: catch up anything already due at boot, then sweep every
+	// minute so a service whose cadence comes due gets backed up promptly.
+	app.StartBackupScheduler(time.Minute)
 	log.Printf("mitia-ops listening on %s", addr)
 	log.Fatal(http.ListenAndServe(addr, app))
 }

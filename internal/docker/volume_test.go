@@ -198,6 +198,73 @@ func TestRelocateVolumeNoopWhenSourceGone(t *testing.T) {
 	}
 }
 
+func TestBackupSnapshotArgv(t *testing.T) {
+	r := &recordingRunner{}
+	vols := []string{"12_pg_data", "12_other"}
+	err := BackupSnapshot(r, vols, "/deploy/12", "/pgstage", "/out/12-pg.tar.gz", VolumeImage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	last := r.rawSeq[len(r.rawSeq)-1]
+	joined := strings.Join(last, " ")
+	for _, want := range []string{
+		"12_pg_data:/snap/volumes/12_pg_data:ro",
+		"12_other:/snap/volumes/12_other:ro",
+		"/deploy/12:/snap/deploy:ro",
+		"/pgstage:/snap/pgdump:ro",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("BackupSnapshot argv missing %q: %v", want, last)
+		}
+	}
+	if !strings.Contains(joined, "volumes deploy pgdump") {
+		t.Fatalf("BackupSnapshot must tar volumes+deploy+pgdump: %v", last)
+	}
+	if !anyContains(last, "czf") {
+		t.Fatalf("BackupSnapshot should create a gzipped tar: %v", last)
+	}
+}
+
+func TestRestoreSnapshotArgv(t *testing.T) {
+	r := &recordingRunner{}
+	err := RestoreSnapshot(r, []string{"12_pg_data"}, "/deploy/12", "/in/snap.tar.gz", VolumeImage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	last := r.rawSeq[len(r.rawSeq)-1]
+	joined := strings.Join(last, " ")
+	if !strings.Contains(joined, "/in/snap.tar.gz:/in/snap.tgz:ro") {
+		t.Fatalf("RestoreSnapshot missing input mount: %v", last)
+	}
+	if !strings.Contains(joined, "12_pg_data:/snap/volumes/12_pg_data") {
+		t.Fatalf("RestoreSnapshot missing volume mount: %v", last)
+	}
+	if !anyContains(last, "xzf") {
+		t.Fatalf("RestoreSnapshot must extract the tar: %v", last)
+	}
+}
+
+func TestDumpPostgresCommand(t *testing.T) {
+	r := &recordingRunner{}
+	out, err := DumpPostgres(r, "12-postgres-1", "mydb", "postgres")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(r.rawSeq) != 1 {
+		t.Fatalf("DumpPostgres should run one command, got %v", r.rawSeq)
+	}
+	got := r.rawSeq[0]
+	if got[0] != "exec" || got[1] != "12-postgres-1" || got[2] != "pg_dump" {
+		t.Fatalf("DumpPostgres argv = %v", got)
+	}
+	if !anyContains(got, "-Fc") || !anyContains(got, "-d") || !anyContains(got, "mydb") || !anyContains(got, "-U") || !anyContains(got, "postgres") {
+		t.Fatalf("DumpPostgres must pass -Fc -d mydb -U postgres: %v", got)
+	}
+	if string(out) != "ok" {
+		t.Fatalf("DumpPostgres should return the raw runner stdout, got %q", out)
+	}
+}
+
 func TestBytesAvailableWalksUpToExistingDir(t *testing.T) {
 	base := t.TempDir()
 	// A non-existent leaf whose parent exists: statfs must resolve by walking up

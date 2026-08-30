@@ -62,6 +62,8 @@ make vet            # go vet
 | `MITIAOPS_DEPLOY`          | `deployments`             | Generated compose output (a `.env` is written only temporarily at launch) |
 | `MITIAOPS_ADDR`            | `:8080`                   | Listen address |
 | `MITIAOPS_CLOUDFLARED_HOME`| `<deploy>/cloudflared`    | App-managed cloudflared home (login cert + tunnel credentials) |
+| `MITIAOPS_BACKUPS`         | `<data>/backups`          | Directory for per-service backup snapshots |
+| `MITIAOPS_BACKUP_SCHEDULE` | `off`                     | Global backup cadence: `off` \| `daily` \| `weekly` \| `@hourly` |
 
 See [`.env.example`](.env.example) for a copy-paste template.
 
@@ -256,6 +258,27 @@ internal/docker      docker compose control
 internal/render      file generation
 internal/web         embedded web UI
 ```
+
+## Backups
+
+Every service page has a **Backups** card with a *Back up now* button. A manual
+(or scheduled) backup takes a live-online snapshot of the service with no
+downtime: it packages the service's named data volumes (e.g. `minio_data`,
+`pg_data`), its deploy directory, and — for postgres — a `pg_dump` into a single
+download-able `tar.gz` stored under `MITIAOPS_BACKUPS` (default `<data>/backups`)
+as `<service-id>/<timestamp>-<id>.tar.gz`. Secrets stay encrypted in SQLite and
+are **never** written into a snapshot. From the card you can download any
+snapshot or restore it in place.
+
+**Automatic backups** are governed by two layers. The global
+`MITIAOPS_BACKUP_SCHEDULE` (`off` | `daily` | `weekly` | `@hourly`, default
+`off`) sets the default cadence, and each service page has an *Automatic
+backups* selector overriding it per service:
+`inherit` (follow the global) | `off` | `@hourly` | `daily` | `weekly`. The
+scheduler sweeps every minute when the app is running and backs up each service
+whose cadence has come due; a failed backup is retried on the next sweep. Manual
+backups always work regardless of the schedule. Deleting a service removes its
+backup snapshots too.
 
 ## Adding a service
 

@@ -126,5 +126,58 @@ func RemoveVolume(raw RawRunner, volumeName string) error {
 	return nil
 }
 
+// BackupSnapshot archives a service's named Docker volumes (mounted readonly
+// under /snap/volumes/<basename>), its deploy dir (under /snap/deploy), and an
+// optional pgdump staging dir (under /snap/pgdump) into a single gzipped tar in
+// outFile, via a disposable container. Volume basenames come from filepath.Base
+// of each volume name. RestoreSnapshot unpacks the same layout back out.
+func BackupSnapshot(raw RawRunner, volumes []string, deployDir, pgdumpDir, outFile, image string) error {
+	args := []string{"run", "--rm"}
+	for _, v := range volumes {
+		args = append(args, "-v", v+":/snap/volumes/"+filepath.Base(v)+":ro")
+	}
+	args = append(args, "-v", deployDir+":/snap/deploy:ro")
+	if pgdumpDir != "" {
+		args = append(args, "-v", pgdumpDir+":/snap/pgdump:ro")
+	}
+	args = append(args, "-v", filepath.Dir(outFile)+":/out", image)
+	names := "volumes deploy"
+	if pgdumpDir != "" {
+		names += " pgdump"
+	}
+	args = append(args, "sh", "-c", "tar -czf /out/snap.tgz -C /snap "+names)
+	if _, err := raw.RunRaw(args...); err != nil {
+		return fmt.Errorf("backup snapshot: %w", err)
+	}
+	return nil
+}
+
+// RestoreSnapshot unpacks a snapshot produced by BackupSnapshot: each named
+// volume's contents under volumes/<basename>/ back into that volume, and the
+// deploy dir contents under deploy/ back into deployDir. Volumes must already
+// exist (callers EnsureVolume them). inFile is the .tar.gz to read.
+func RestoreSnapshot(raw RawRunner, volumes []string, deployDir, inFile, image string) error {
+	args := []string{"run", "--rm", "-v", inFile + ":/in/snap.tgz:ro"}
+	for _, v := range volumes {
+		args = append(args, "-v", v+":/snap/volumes/"+filepath.Base(v))
+	}
+	args = append(args, "-v", deployDir+":/snap/deploy", image, "sh", "-c", "tar -xzf /in/snap.tgz -C /snap")
+	if _, err := raw.RunRaw(args...); err != nil {
+		return fmt.Errorf("restore snapshot: %w", err)
+	}
+	return nil
+}
+
+// DumpPostgres runs pg_dump against the named running container and returns the
+// custom-format (-Fc) dump bytes.
+func DumpPostgres(raw RawRunner, container, db, user string) ([]byte, error) {
+	args := []string{"exec", container, "pg_dump", "-U", user, "-d", db, "-Fc"}
+	out, err := raw.RunRaw(args...)
+	if err != nil {
+		return nil, fmt.Errorf("pg_dump %s: %w", container, err)
+	}
+	return []byte(out), nil
+}
+
 // VolumeImage is the lightweight helper image used to move volume data.
 const VolumeImage = "alpine:3.20"

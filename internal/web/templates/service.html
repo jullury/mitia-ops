@@ -55,6 +55,17 @@
         <label for="autostart">Start on boot</label>
       </div>
       <p class="hint" style="margin-top:.25rem">Bring this service up automatically when the app starts &mdash; e.g. after the host reboots.</p>
+      {{ if .BackupConfigured }}
+      <div class="row">
+        <label for="backup_schedule">Automatic backups</label>
+        <select name="backup_schedule" id="backup_schedule">
+          {{ range .BackupSchedules }}
+          <option value="{{ . }}" {{ if eq . $.BackupSchedule }}selected{{ end }}>{{ . }}</option>
+          {{ end }}
+        </select>
+        <p class="hint">inherit (default) follows MITIAOPS_BACKUP_SCHEDULE; off disables scheduled backups for this service; @hourly / daily / weekly override the global. Manual "Back up now" always works.</p>
+      </div>
+      {{ end }}
     </fieldset>
   </div>
 
@@ -123,6 +134,37 @@
     <button class="btn primary" type="submit" id="saveBtn">Save changes</button>
   </div>
 </form>
+
+{{ if .BackupConfigured }}
+<div class="card">
+  <h2 class="card-title">Backups</h2>
+  <form method="post" action="/service/{{ .Service.ID }}/backup" style="margin-bottom:.75rem">
+    <button class="btn primary" type="submit">Back up now</button>
+    <p class="hint" style="margin-top:.25rem">Captures the service's data volumes and config directory{{ if eq .Service.Kind "postgres" }} plus a pg_dump{{ end }} into a single download-able snapshot. Secrets stay encrypted in the app database and are never written into a snapshot.</p>
+  </form>
+  <table>
+    <tr><th>Snapshot</th><th>Size</th><th>Created</th><th></th></tr>
+    {{ range .Backups }}
+    <tr>
+      <td class="mono">{{ .Filename }}</td>
+      <td>{{ .Size }} B</td>
+      <td>{{ .CreatedAt }}</td>
+      <td>
+        <div class="actions">
+          <a class="btn" href="/service/{{ $.Service.ID }}/backup/{{ .ID }}/download">Download</a>
+          <form method="post" action="/service/{{ $.Service.ID }}/backup/{{ .ID }}/restore"
+                onsubmit="return confirm('Restore {{ .Filename }}? The service is stopped, its current data is replaced from this snapshot, and it is started again.')">
+            <button class="btn muted" type="submit">Restore</button>
+          </form>
+        </div>
+      </td>
+    </tr>
+    {{ else }}
+    <tr><td colspan="4" class="hint">No backups yet. Press "Back up now" to create the first snapshot.</td></tr>
+    {{ end }}
+  </table>
+</div>
+{{ end }}
 
 <script>
 (function () {
