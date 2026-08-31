@@ -1,6 +1,13 @@
 # Changelog
 
 
+## [1.5.0](https://github.com/jullury/mitia-ops/compare/v1.4.1...v1.5.0) (2026-08-31)
+
+
+### Features
+
+* **install:** always fetch latest via MITIAOPS_FORCE_DOWNLOAD ([2a3c845](https://github.com/jullury/mitia-ops/commit/2a3c84506b9ef077efcb2c56f7e505593f57a992))
+
 ## [1.4.1](https://github.com/jullury/mitia-ops/compare/v1.4.0...v1.4.1) (2026-08-31)
 
 
