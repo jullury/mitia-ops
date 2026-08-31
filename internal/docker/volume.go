@@ -127,11 +127,12 @@ func RemoveVolume(raw RawRunner, volumeName string) error {
 }
 
 // BackupSnapshot archives a service's named Docker volumes (mounted readonly
-// under /snap/volumes/<basename>), its deploy dir (under /snap/deploy), and an
-// optional pgdump staging dir (under /snap/pgdump) into a single gzipped tar in
-// outFile, via a disposable container. Volume basenames come from filepath.Base
-// of each volume name. RestoreSnapshot unpacks the same layout back out.
-func BackupSnapshot(raw RawRunner, volumes []string, deployDir, pgdumpDir, outFile, image string) error {
+// under /snap/volumes/<basename>), its deploy dir (under /snap/deploy), and
+// optional staging dirs (pgdump under /snap/pgdump, minio buckets under
+// /snap/minio) into a single gzipped tar in outFile, via a disposable
+// container. Volume basenames come from filepath.Base of each volume name.
+// RestoreSnapshot unpacks the same layout back out.
+func BackupSnapshot(raw RawRunner, volumes []string, deployDir, pgdumpDir, minioDir, outFile, image string) error {
 	args := []string{"run", "--rm"}
 	for _, v := range volumes {
 		args = append(args, "-v", v+":/snap/volumes/"+filepath.Base(v)+":ro")
@@ -140,10 +141,16 @@ func BackupSnapshot(raw RawRunner, volumes []string, deployDir, pgdumpDir, outFi
 	if pgdumpDir != "" {
 		args = append(args, "-v", pgdumpDir+":/snap/pgdump:ro")
 	}
+	if minioDir != "" {
+		args = append(args, "-v", minioDir+":/snap/minio:ro")
+	}
 	args = append(args, "-v", filepath.Dir(outFile)+":/out", image)
 	names := "volumes deploy"
 	if pgdumpDir != "" {
 		names += " pgdump"
+	}
+	if minioDir != "" {
+		names += " minio"
 	}
 	args = append(args, "sh", "-c", "tar -czf /out/snap.tgz -C /snap "+names)
 	if _, err := raw.RunRaw(args...); err != nil {

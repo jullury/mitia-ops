@@ -201,7 +201,7 @@ func TestRelocateVolumeNoopWhenSourceGone(t *testing.T) {
 func TestBackupSnapshotArgv(t *testing.T) {
 	r := &recordingRunner{}
 	vols := []string{"12_pg_data", "12_other"}
-	err := BackupSnapshot(r, vols, "/deploy/12", "/pgstage", "/out/12-pg.tar.gz", VolumeImage)
+	err := BackupSnapshot(r, vols, "/deploy/12", "/pgstage", "", "/out/12-pg.tar.gz", VolumeImage)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -222,6 +222,23 @@ func TestBackupSnapshotArgv(t *testing.T) {
 	}
 	if !anyContains(last, "czf") {
 		t.Fatalf("BackupSnapshot should create a gzipped tar: %v", last)
+	}
+}
+
+func TestBackupSnapshotIncludesMinioStage(t *testing.T) {
+	r := &recordingRunner{}
+	vols := []string{"12_minio_data"}
+	err := BackupSnapshot(r, vols, "/deploy/12", "", "/minstage", "/out/12-minio.tar.gz", VolumeImage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	last := r.rawSeq[len(r.rawSeq)-1]
+	joined := strings.Join(last, " ")
+	if !strings.Contains(joined, "/minstage:/snap/minio:ro") {
+		t.Fatalf("BackupSnapshot missing minio stage mount: %v", last)
+	}
+	if !strings.Contains(joined, "volumes deploy minio") {
+		t.Fatalf("BackupSnapshot must tar volumes+deploy+minio: %v", last)
 	}
 }
 

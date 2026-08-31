@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -135,11 +136,11 @@ type server struct {
 type JobState string
 
 const (
-	JobCloning    JobState = "cloning"
-	JobPulling    JobState = "pulling"
-	JobBackingUp  JobState = "backing-up"
-	JobRunning    JobState = "running"
-	JobError      JobState = "error"
+	JobCloning   JobState = "cloning"
+	JobPulling   JobState = "pulling"
+	JobBackingUp JobState = "backing-up"
+	JobRunning   JobState = "running"
+	JobError     JobState = "error"
 )
 
 // job is one in-flight background deployment for a single service.
@@ -406,23 +407,64 @@ func (s *server) renderService(w http.ResponseWriter, r *http.Request, id string
 		}
 	}
 	backups, _ := s.cfg.DB.ListBackups(id)
+	isMinio := services.Kind(svc.Kind) == services.KindMinio
+	var minioBuckets []string
+	enabledBuckets := map[string]bool{}
+	minioErr := ""
+	if isMinio {
+		enabled, _ := parseBucketList(items[bucketBackupKey])
+		for _, b := range enabled {
+			enabledBuckets[b] = true
+		}
+		detected := []string{}
+		if s.cfg.BackupDir != "" && s.cfg.DockerRaw != nil {
+			bs := s.backupService()
+			mc, merr := bs.minioClient(id)
+			if merr == nil {
+				if list, lerr := docker.ListMinioBuckets(s.cfg.DockerRaw, mc); lerr == nil {
+					detected = list
+				} else {
+					minioErr = "could not list buckets (is the service running?)"
+				}
+			}
+		}
+		// Union of detected and already-enabled buckets so a down server (or a
+		// brand-new bucket) does not drop the user's saved selection on save.
+		seen := map[string]bool{}
+		all := append([]string{}, enabled...)
+		for _, b := range detected {
+			if !seen[b] && !enabledBuckets[b] {
+				all = append(all, b)
+			}
+		}
+		for _, b := range all {
+			if !seen[b] {
+				seen[b] = true
+				minioBuckets = append(minioBuckets, b)
+			}
+		}
+	}
 	s.svcTmpl.ExecuteTemplate(w, "base.html", svcData{
-		Def:       def,
-		Service:   svc,
-		Values:    values,
-		SecretSet: secrets,
-		Lists:     lists,
-		ConfigURL: url,
-		Msg:       msg,
-		MsgError:  msgErr,
-		HasSize:   hasSizeField(def),
-		Autostart: items[autostartKey] == "true",
-		JobState:  jobState,
-		JobMsg:    jobMsg,
-		Backups:   backups,
+		Def:              def,
+		Service:          svc,
+		Values:           values,
+		SecretSet:        secrets,
+		Lists:            lists,
+		ConfigURL:        url,
+		Msg:              msg,
+		MsgError:         msgErr,
+		HasSize:          hasSizeField(def),
+		Autostart:        items[autostartKey] == "true",
+		JobState:         jobState,
+		JobMsg:           jobMsg,
+		Backups:          backups,
 		BackupConfigured: s.cfg.BackupDir != "",
 		BackupSchedule:   items[backupScheduleKey],
 		BackupSchedules:  []string{"inherit", "off", "@hourly", "daily", "weekly"},
+		IsMinio:          isMinio,
+		MinioBuckets:     minioBuckets,
+		EnabledBuckets:   enabledBuckets,
+		MinioBucketsErr:  minioErr,
 	})
 }
 
@@ -445,6 +487,15 @@ type svcData struct {
 	BackupConfigured bool
 	BackupSchedule   string // per-service schedule selector value
 	BackupSchedules  []string
+	// Minio per-bucket backup toggles: IsMinio flags the kind, MinioBuckets is
+	// the bucket names detected on the running server (may be empty when the
+	// service is down), EnabledBuckets is the set the user has chosen, and
+	// MinioBucketsErr reports a detection failure (server unreachable) so the
+	// UI can show an offline note instead of silently hiding the section.
+	IsMinio         bool
+	MinioBuckets    []string
+	EnabledBuckets  map[string]bool
+	MinioBucketsErr string
 }
 
 // hasSizeField reports whether a definition declares a FieldSize field (i.e. a
@@ -582,6 +633,21 @@ func (s *server) saveService(w http.ResponseWriter, r *http.Request) {
 		schedule = "inherit"
 	}
 	items = append(items, db.ConfigItem{Key: backupScheduleKey, Value: schedule})
+	// Minio-only: the set of buckets to back up, given by the "minio_bucket_<n>"
+	// checkboxes (value = bucket name). Empty ⇒ fall back to the whole-volume
+	// snapshot. Form field order is stable, so sorting the names keeps the
+	// stored list deterministic for rendering.
+	if def.Kind == services.KindMinio {
+		var enabled []string
+		for key, vs := range r.Form {
+			if !strings.HasPrefix(key, "minio_bucket_") || len(vs) == 0 || vs[0] == "" {
+				continue
+			}
+			enabled = append(enabled, vs[len(vs)-1])
+		}
+		sort.Strings(enabled)
+		items = append(items, db.ConfigItem{Key: bucketBackupKey, Value: strings.Join(enabled, ",")})
+	}
 	dir := s.deployDir(id)
 
 	// A change to a resizeable data volume's size is preflighted for free space

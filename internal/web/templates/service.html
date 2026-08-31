@@ -69,6 +69,24 @@
     </fieldset>
   </div>
 
+  {{ if and .IsMinio .BackupConfigured }} {{/* Minio per-bucket backup toggles */}}
+  <div class="card">
+    <h2 class="card-title">Backup buckets</h2>
+    <fieldset class="field-group">
+      <p class="hint">Choose which buckets to back up. Each selected bucket is dumped individually and restored bucket-by-bucket; unselected buckets are not captured.</p>
+      {{ if .MinioBucketsErr }}<p class="hint" style="color:var(--danger,#b91c1c)">{{ .MinioBucketsErr }} Your saved selection is kept; the physical volume snapshot is still taken as a fallback.</p>{{ end }}
+      {{ range $i, $b := .MinioBuckets }}
+      <div class="check-row">
+        <input type="checkbox" id="minio_bucket_{{ $i }}" name="minio_bucket_{{ $i }}" value="{{ $b }}" {{ if index $.EnabledBuckets $b }}checked{{ end }}>
+        <label for="minio_bucket_{{ $i }}">{{ $b }}</label>
+      </div>
+      {{ else }}
+      <p class="hint">No buckets detected yet. Start the service, create buckets, then reload this page.</p>
+      {{ end }}
+    </fieldset>
+  </div>
+  {{ end }}
+
   {{ if .HasSize }} {{/* Storage / resizeable volume section */}}
   <div class="card">
     <h2 class="card-title">Storage</h2>

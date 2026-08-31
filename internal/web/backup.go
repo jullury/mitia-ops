@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jullury/mitia-ops/internal/crypto"
 	"github.com/jullury/mitia-ops/internal/db"
 	"github.com/jullury/mitia-ops/internal/docker"
 	"github.com/jullury/mitia-ops/internal/services"
@@ -104,6 +105,7 @@ type BackupService struct {
 	Docker    docker.RawRunner
 	DockerC   docker.Runner
 	DeployDir string
+	Cipher    *crypto.Cipher // decrypts secret config values (e.g. minio root password)
 }
 
 // Run takes one backup of the given service and records it. It returns the
@@ -134,6 +136,14 @@ func (b *BackupService) Run(id string) (string, error) {
 			defer os.RemoveAll(pgStage)
 		}
 	}
+	// Stage per-bucket logical dumps (minio only) before the snapshot.
+	minioStage := ""
+	if kind == services.KindMinio {
+		if stage, derr := b.dumpMinioBuckets(id); derr == nil {
+			minioStage = stage
+			defer os.RemoveAll(minioStage)
+		}
+	}
 
 	stage, err := os.MkdirTemp("", "mitia-ops-backup-")
 	if err != nil {
@@ -144,7 +154,7 @@ func (b *BackupService) Run(id string) (string, error) {
 	ts := time.Now()
 	filename := backupFilename(string(kind), ts)
 	out := filepath.Join(stage, "snap.tgz")
-	if err := docker.BackupSnapshot(b.Docker, vols, dir, pgStage, out, docker.VolumeImage); err != nil {
+	if err := docker.BackupSnapshot(b.Docker, vols, dir, pgStage, minioStage, out, docker.VolumeImage); err != nil {
 		return "", err
 	}
 
@@ -236,7 +246,90 @@ func (s *server) backupService() *BackupService {
 		Docker:    s.cfg.DockerRaw,
 		DockerC:   s.cfg.Docker,
 		DeployDir: s.cfg.DeployDir,
+		Cipher:    s.cfg.Cipher,
 	}
+}
+
+// parseBucketList splits a comma-separated bucket list, trimming whitespace
+// and dropping empties. Any invalid characters are rejected.
+func parseBucketList(s string) ([]string, error) {
+	var out []string
+	for _, part := range strings.Split(s, ",") {
+		name := strings.TrimSpace(part)
+		if name == "" {
+			continue
+		}
+		if strings.ContainsAny(name, " /\\:*?\"<>|") {
+			return nil, fmt.Errorf("invalid bucket name %q", name)
+		}
+		out = append(out, name)
+	}
+	return out, nil
+}
+
+// minioClient builds an mc client for a minio service's running container from
+// its stored config (endpoint is the compose-internal service address). The
+// root password is decrypted from the config store.
+func (b *BackupService) minioClient(id string) (docker.MinioClient, error) {
+	items, err := b.DB.ConfigItems(id)
+	if err != nil {
+		return docker.MinioClient{}, err
+	}
+	pass := items["MINIO_ROOT_PASSWORD"]
+	if b.Cipher != nil && pass != "" {
+		if dec, derr := b.Cipher.Decrypt(pass); derr == nil {
+			pass = dec
+		}
+	}
+	base := filepath.Base(filepath.Join(b.DeployDir, id))
+	return docker.MinioClient{
+		HTTPAddr: "http://" + base + "-minio-1:9000",
+		User:     items["MINIO_ROOT_USER"],
+		Password: pass,
+		Network:  base + "_default",
+	}, nil
+}
+
+// dumpMinioBuckets mirrors each configured bucket into a staging dir under the
+// snapshot dir so the snapshot can bundle per-bucket dumps, and returns the
+// staging root (or "" when no buckets are configured). A down/unreachable
+// server is a non-fatal skip (returns "", nil) so the snapshot still captures
+// the raw volume.
+func (b *BackupService) dumpMinioBuckets(id string) (string, error) {
+	items, err := b.DB.ConfigItems(id)
+	if err != nil {
+		return "", err
+	}
+	buckets, err := parseBucketList(items[bucketBackupKey])
+	if err != nil {
+		return "", err
+	}
+	if len(buckets) == 0 {
+		return "", nil
+	}
+	mc, err := b.minioClient(id)
+	if err != nil {
+		return "", err
+	}
+	stageRoot := filepath.Join(b.Dir, id, ".minio")
+	// Start from a clean staging dir so buckets removed from the config (or a
+	// bucket shrunk on the server) never leak stale files into the snapshot.
+	if err := os.RemoveAll(stageRoot); err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(stageRoot, 0o755); err != nil {
+		return "", err
+	}
+	for _, bucket := range buckets {
+		d := filepath.Join(stageRoot, bucket)
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			return "", err
+		}
+		if err := docker.MirrorMinioBucket(b.Docker, mc, bucket, d); err != nil {
+			return "", fmt.Errorf("mirror bucket %s: %w", bucket, err)
+		}
+	}
+	return stageRoot, nil
 }
 
 // backupNow starts a background backup job for a service (so large snapshots
@@ -342,6 +435,12 @@ func (s *server) doRestore(id string, b db.Backup) error {
 	if def.Kind == services.KindPostgres {
 		return restorePostgresDump(s, id, bs, dir, vols, inFile)
 	}
+	if def.Kind == services.KindMinio {
+		items, _ := s.cfg.DB.ConfigItems(id)
+		if buckets, _ := parseBucketList(items[bucketBackupKey]); len(buckets) > 0 {
+			return restoreMinioBuckets(s, id, bs, dir, vols, buckets, inFile)
+		}
+	}
 
 	// 2. generic: replace the owned volumes and the deploy dir from the archive.
 	for _, v := range vols {
@@ -433,10 +532,82 @@ func restorePostgresFromArchive(raw docker.RawRunner, inFile, container, db, use
 	return nil
 }
 
+// extractSnapshotMember extracts a top-level directory (member) from a snapshot
+// archive into hostDir via a disposable container. The chmod makes the restored
+// files world-readable so they can be bind-mounted back for the next step.
+func extractSnapshotMember(raw docker.RawRunner, inFile, member, hostDir string) error {
+	abs, err := filepath.Abs(hostDir)
+	if err != nil {
+		return err
+	}
+	if _, err := raw.RunRaw("run", "--rm",
+		"-v", inFile+":/in/snap.tgz:ro",
+		"-v", abs+":/out",
+		docker.VolumeImage,
+		"sh", "-c", "tar -xzf /in/snap.tgz -C /out "+member+" && chmod -R a+rX /out/"+member); err != nil {
+		return fmt.Errorf("extract %s: %w", member, err)
+	}
+	return nil
+}
+
+// restoreMinioBuckets restores a minio backup logically, bucket by bucket. The
+// data volume is dropped and recreated fresh, the deploy dir is restored, the
+// service is started, and each previously-backed-up bucket is recreated and
+// repopulated from its per-bucket dump. Only the buckets that were backed up
+// (the current config) are restored.
+func restoreMinioBuckets(s *server, id string, bs *BackupService, dir string, vols []string, buckets []string, inFile string) error {
+	// Drop and recreate the minio volume(s) fresh.
+	for _, v := range vols {
+		if ok, _ := docker.VolumeExists(bs.Docker, v); ok {
+			if err := docker.RemoveVolume(bs.Docker, v); err != nil {
+				return fmt.Errorf("remove volume %s: %w", v, err)
+			}
+		}
+		if err := docker.EnsureVolume(bs.Docker, v); err != nil {
+			return fmt.Errorf("recreate volume %s: %w", v, err)
+		}
+	}
+	// Restore only the deploy dir (compose + env) so minio boots with the same
+	// credentials and endpoint.
+	if err := docker.RestoreSnapshot(bs.Docker, nil, dir, inFile, docker.VolumeImage); err != nil {
+		return fmt.Errorf("restore deploy dir: %w", err)
+	}
+	// Start minio on the fresh volume.
+	if _, err := docker.Up(dir, s.cfg.Docker); err != nil {
+		return fmt.Errorf("start minio: %w", err)
+	}
+	// Extract the per-bucket dumps and mirror each back into a recreated bucket.
+	tmp, err := os.MkdirTemp("", "miniorestore-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(tmp)
+	if err := extractSnapshotMember(bs.Docker, inFile, "minio", tmp); err != nil {
+		return fmt.Errorf("extract bucket dumps: %w", err)
+	}
+	mc, err := bs.minioClient(id)
+	if err != nil {
+		return err
+	}
+	for _, bucket := range buckets {
+		hostDir := filepath.Join(tmp, "minio", bucket)
+		if err := docker.MakeMinioBucket(bs.Docker, mc, bucket); err != nil {
+			return err
+		}
+		if err := docker.RestoreMinioBucket(bs.Docker, mc, bucket, hostDir); err != nil {
+			return fmt.Errorf("restore bucket %s: %w", bucket, err)
+		}
+	}
+	return nil
+}
+
 // config keys for per-service backup scheduling.
 const (
 	backupScheduleKey = "backup_schedule" // inherit | off | @hourly | daily | weekly
 	backupLastRunKey  = "backup_last_run" // RFC3339; set when the last backup succeeded
+	// bucketBackupKey stores the comma-separated list of minio buckets to back
+	// up logically (per bucket). Empty ⇒ fall back to the whole-volume snapshot.
+	bucketBackupKey = "minio_backup_buckets"
 )
 
 // StartBackupScheduler launches the periodic backup sweep in the background. It

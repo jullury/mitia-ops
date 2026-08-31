@@ -3,6 +3,7 @@ package web
 import (
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -22,11 +23,20 @@ import (
 // DB rows without a Docker daemon.
 type fakeSnapshotRunner struct {
 	fakeRawRunner
+	// mcBuckets is the bucket list returned for a "mc ls" query (nil ⇒ none).
+	mcBuckets []string
 }
 
 func (f *fakeSnapshotRunner) RunRaw(args ...string) (string, error) {
-	out, err := f.fakeRawRunner.RunRaw(args...)
 	joined := strings.Join(args, " ")
+	if strings.Contains(joined, "mc ls --json") {
+		var b strings.Builder
+		for _, name := range f.mcBuckets {
+			b.WriteString(`{"status":"success","type":"folder","size":0,"key":"` + name + `"}` + "\n")
+		}
+		return b.String(), nil
+	}
+	out, err := f.fakeRawRunner.RunRaw(args...)
 	for _, a := range args {
 		if strings.HasSuffix(a, ":/out") {
 			host := strings.TrimSpace(strings.TrimSuffix(a, ":/out"))
@@ -191,6 +201,97 @@ func TestBackupRunResolvesExternalMinioVolume(t *testing.T) {
 	}
 }
 
+// TestBackupRunMinioMirrorsConfiguredBuckets checks that when buckets are
+// configured, the backup mirrors each bucket logically and folds them into the
+// snapshot, instead of relying solely on the physical volume.
+func TestBackupRunMinioMirrorsConfiguredBuckets(t *testing.T) {
+	d, err := db.Open(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	sid, _ := d.CreateService("minio", "m")
+	deployDir := t.TempDir()
+	svcDir := filepath.Join(deployDir, sid)
+	_ = os.MkdirAll(svcDir, 0o755)
+	_ = os.WriteFile(filepath.Join(svcDir, "docker-compose.yml"), []byte("services: {}\n"), 0o644)
+	c, _ := crypto.New("master")
+	enc, _ := c.Encrypt("secretpass")
+	if err := d.SetConfigItems(sid, []db.ConfigItem{
+		{Key: bucketBackupKey, Value: "photos, docs"},
+		{Key: "MINIO_ROOT_USER", Value: "minioadmin"},
+		{Key: "MINIO_ROOT_PASSWORD", Value: enc},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	raw := &fakeSnapshotRunner{}
+	bs := &BackupService{
+		DB:        d,
+		Dir:       filepath.Join(t.TempDir(), "backups"),
+		Docker:    raw,
+		DockerC:   &fakeRunner{},
+		DeployDir: deployDir,
+		Cipher:    c,
+	}
+	if _, err := bs.Run(sid); err != nil {
+		t.Fatalf("backup run: %v", err)
+	}
+	joined := strings.Join(raw.ran, " ")
+	if strings.Count(joined, "mc mirror") < 2 {
+		t.Fatalf("expected both buckets to be mirrored, got %v", raw.ran)
+	}
+	if !strings.Contains(joined, "mitia/photos") || !strings.Contains(joined, "mitia/docs") {
+		t.Fatalf("mirror should target configured buckets: %v", raw.ran)
+	}
+	if !strings.Contains(joined, ".minio:/snap/minio:ro") {
+		t.Fatalf("snapshot should bundle the minio bucket stage: %v", joined)
+	}
+}
+
+// TestBackupRunMinioNoBucketsFallsBackToVolume checks that without configured
+// buckets the backup takes the whole-volume snapshot and never runs mc.
+func TestBackupRunMinioNoBucketsFallsBackToVolume(t *testing.T) {
+	d, err := db.Open(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	sid, _ := d.CreateService("minio", "m")
+	deployDir := t.TempDir()
+	_ = os.MkdirAll(filepath.Join(deployDir, sid), 0o755)
+	raw := &fakeSnapshotRunner{}
+	bs := &BackupService{
+		DB:        d,
+		Dir:       filepath.Join(t.TempDir(), "backups"),
+		Docker:    raw,
+		DockerC:   &fakeRunner{},
+		DeployDir: deployDir,
+	}
+	if _, err := bs.Run(sid); err != nil {
+		t.Fatalf("backup run: %v", err)
+	}
+	if strings.Contains(strings.Join(raw.ran, " "), "mc mirror") {
+		t.Fatalf("no buckets configured => no mc mirror, got %v", raw.ran)
+	}
+}
+
+// TestParseBucketList validates bucket list parsing and rejection of bad names.
+func TestParseBucketList(t *testing.T) {
+	got, err := parseBucketList(" photos, docs , ,")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0] != "photos" || got[1] != "docs" {
+		t.Fatalf("unexpected list %v", got)
+	}
+	if _, err := parseBucketList("bad/name"); err == nil {
+		t.Fatal("invalid bucket name should error")
+	}
+	if got, _ := parseBucketList(""); len(got) != 0 {
+		t.Fatalf("empty list should parse to nothing, got %v", got)
+	}
+}
+
 func newServiceTestApp(t *testing.T, kind string) (*db.DB, http.Handler, string) {
 	t.Helper()
 	d, err := db.Open(filepath.Join(t.TempDir(), "t.db"))
@@ -201,12 +302,12 @@ func newServiceTestApp(t *testing.T, kind string) (*db.DB, http.Handler, string)
 	c, _ := crypto.New("master")
 	deployDir := t.TempDir()
 	h := New(Config{
-		DB:            d,
-		Cipher:        c,
-		DeployDir:     deployDir,
-		Docker:        &fakeRunner{},
-		DockerRaw:     &fakeSnapshotRunner{},
-		BackupDir:     filepath.Join(t.TempDir(), "backups"),
+		DB:             d,
+		Cipher:         c,
+		DeployDir:      deployDir,
+		Docker:         &fakeRunner{},
+		DockerRaw:      &fakeSnapshotRunner{},
+		BackupDir:      filepath.Join(t.TempDir(), "backups"),
 		BackupSchedule: "off",
 	})
 	sid, err := d.CreateService(kind, kind)
@@ -234,6 +335,65 @@ func TestManualBackupCreatesRow(t *testing.T) {
 	waitForBackup(t, d, sid, 1)
 	if rows, _ := d.ListBackups(sid); rows[0].Kind != "minio" || rows[0].Size <= 0 {
 		t.Fatalf("unexpected backup row: %+v", rows[0])
+	}
+}
+
+// TestServicePageListsMinioBuckets checks the service page renders a checkbox
+// per detected bucket so the operator can toggle which get backed up.
+func TestServicePageListsMinioBuckets(t *testing.T) {
+	_, h, sid := newServiceTestApp(t, "minio")
+	app := h.(*App)
+	app.s.cfg.DockerRaw.(*fakeSnapshotRunner).mcBuckets = []string{"photos", "docs", "archive"}
+	req := httptest.NewRequest("GET", "/service/"+sid, nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	body := rec.Body.String()
+	if !strings.Contains(body, "Backup buckets") {
+		t.Fatalf("page should show the Backup buckets section")
+	}
+	for _, b := range []string{"photos", "docs", "archive"} {
+		if !strings.Contains(body, `value="`+b+`"`) {
+			t.Fatalf("page should list bucket %q checkbox", b)
+		}
+	}
+}
+
+// TestSaveServicePersistsEnabledBuckets checks saving the service persists the
+// checked buckets as the comma-separated backup list.
+func TestSaveServicePersistsEnabledBuckets(t *testing.T) {
+	d, h, sid := newServiceTestApp(t, "minio")
+	app := h.(*App)
+	app.s.cfg.DockerRaw.(*fakeSnapshotRunner).mcBuckets = []string{"photos", "docs"}
+	form := url.Values{}
+	form.Set("minio_bucket_0", "photos")
+	form.Set("minio_bucket_1", "docs")
+	form.Set("backup_schedule", "inherit")
+	req := httptest.NewRequest("POST", "/service/"+sid, strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	items, _ := d.ConfigItems(sid)
+	if items[bucketBackupKey] != "docs,photos" {
+		t.Fatalf("stored buckets = %q, want sorted docs,photos", items[bucketBackupKey])
+	}
+}
+
+// TestSaveServiceNoBucketsClearsSelection checks that saving with no buckets
+// checked clears the backup list (falls back to the volume snapshot).
+func TestSaveServiceNoBucketsClearsSelection(t *testing.T) {
+	d, h, sid := newServiceTestApp(t, "minio")
+	if err := d.SetConfigItems(sid, []db.ConfigItem{{Key: bucketBackupKey, Value: "photos"}}); err != nil {
+		t.Fatal(err)
+	}
+	form := url.Values{}
+	form.Set("backup_schedule", "inherit")
+	req := httptest.NewRequest("POST", "/service/"+sid, strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	items, _ := d.ConfigItems(sid)
+	if items[bucketBackupKey] != "" {
+		t.Fatalf("stored buckets should be cleared, got %q", items[bucketBackupKey])
 	}
 }
 
@@ -325,6 +485,56 @@ func TestRestoreBackupPostgresReimportsDump(t *testing.T) {
 	composeCalls := strings.Join(app.s.cfg.Docker.(*fakeRunner).recorded(), " ")
 	if !strings.Contains(composeCalls, "up -d") {
 		t.Fatalf("postgres restore should start the service before import, got %q", composeCalls)
+	}
+}
+
+// TestRestoreBackupMinioRecreatesBuckets checks that a minio restore with
+// configured buckets drops the volume, restarts the service, and repopulates
+// each bucket logically via mc (mb + mirror) rather than a physical overlay.
+func TestRestoreBackupMinioRecreatesBuckets(t *testing.T) {
+	d, h, sid := newServiceTestApp(t, "minio")
+	app := h.(*App)
+	c, _ := crypto.New("master")
+	enc, _ := c.Encrypt("secretpass")
+	if err := d.SetConfigItems(sid, []db.ConfigItem{
+		{Key: bucketBackupKey, Value: "photos"},
+		{Key: "MINIO_ROOT_USER", Value: "minioadmin"},
+		{Key: "MINIO_ROOT_PASSWORD", Value: enc},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(app.s.cfg.BackupDir, sid), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fn := "20260831T120000-minio.tar.gz"
+	if err := os.WriteFile(filepath.Join(app.s.cfg.BackupDir, sid, fn), []byte("SNAP"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.CreateBackup(db.Backup{ID: "b1", ServiceID: sid, Kind: "minio", Filename: fn, Size: 4, CreatedAt: "2026-08-31T12:00:00Z"}); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest("POST", "/service/"+sid+"/backup/b1/restore", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("restore status %d: %s", rec.Code, rec.Body.String())
+	}
+	joined := strings.Join(app.s.cfg.DockerRaw.(*fakeSnapshotRunner).ran, " ")
+	if !strings.Contains(joined, "mc mb") {
+		t.Fatalf("minio restore should recreate buckets with mc mb, got %v", joined)
+	}
+	if !strings.Contains(joined, "mc mirror") || !strings.Contains(joined, "mitia/photos") {
+		t.Fatalf("minio restore should mirror each bucket back, got %v", joined)
+	}
+	if !strings.Contains(joined, "/minio/photos:/src") {
+		t.Fatalf("minio restore should mirror from the extracted bucket dump, got %v", joined)
+	}
+	if !strings.Contains(joined, "tar -xzf /in/snap.tgz -C /out minio ") {
+		t.Fatalf("minio restore should extract the bucket dumps, got %v", joined)
+	}
+	composeCalls := strings.Join(app.s.cfg.Docker.(*fakeRunner).recorded(), " ")
+	if !strings.Contains(composeCalls, "down") || !strings.Contains(composeCalls, "up -d") {
+		t.Fatalf("minio restore should stop then start the service, got %q", composeCalls)
 	}
 }
 
