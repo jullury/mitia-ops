@@ -1,6 +1,13 @@
 # Changelog
 
 
+## [1.4.1](https://github.com/jullury/mitia-ops/compare/v1.4.0...v1.4.1) (2026-08-31)
+
+
+### Bug Fixes
+
+* **cloudflared:** parse tunnel JSON when warning log precedes it ([0a219a9](https://github.com/jullury/mitia-ops/commit/0a219a9b13c52e79f0a2fe548ee76a21ab165d4f))
+
 ## [1.4.0](https://github.com/jullury/mitia-ops/compare/v1.3.0...v1.4.0) (2026-08-31)
 
 
