@@ -12,7 +12,7 @@ package services
 // Cloudflared has its own constant in internal/cloudflared (CloudflaredImage)
 // because both the CLI runner and the compose file reference it.
 const (
-	minioImage    = "minio/minio:RELEASE.2025-09-07T16-13-09Z"
+	garageImage   = "dxflrs/garage:v2.3.0"
 	vaultImage    = "hashicorp/vault:2.0.4"
 	caddyImage    = "caddy:2.11.4"
 	postgresImage = "postgres:16-alpine"

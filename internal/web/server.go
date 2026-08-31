@@ -1,7 +1,9 @@
 package web
 
 import (
+	"crypto/rand"
 	"embed"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +17,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -148,6 +151,19 @@ type job struct {
 	state JobState
 	msg   string
 	err   string
+	at    time.Time
+}
+
+// jobRetention is how long a terminal (finished) job is retained after it ends,
+// long enough for the polling UI to read the final state and reload once. A
+// finished job must never linger indefinitely: every service row renders its job
+// state, and a stale terminal state would make the dashboard treat a finished
+// deployment as a fresh "running" result and reload the page in a loop.
+const jobRetention = 5 * time.Second
+
+// isTerminal reports whether the job has finished (success or failure).
+func isTerminal(s JobState) bool {
+	return s == JobRunning || s == JobError
 }
 
 // jobTracker holds the current background deployment job per service id. It is
@@ -156,15 +172,16 @@ type job struct {
 type jobTracker struct {
 	mu   sync.Mutex
 	jobs map[string]job
+	now  func() time.Time
 }
 
 func newJobTracker() *jobTracker {
-	return &jobTracker{jobs: map[string]job{}}
+	return &jobTracker{jobs: map[string]job{}, now: time.Now}
 }
 
 func (t *jobTracker) set(id string, state JobState, msg, err string) {
 	t.mu.Lock()
-	t.jobs[id] = job{state: state, msg: msg, err: err}
+	t.jobs[id] = job{state: state, msg: msg, err: err, at: t.now()}
 	t.mu.Unlock()
 }
 
@@ -172,7 +189,16 @@ func (t *jobTracker) get(id string) (job, bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	j, ok := t.jobs[id]
-	return j, ok
+	if !ok {
+		return job{}, false
+	}
+	// Prune terminal jobs that outlived their retention window so stale "done"
+	// states don't accumulate and don't re-trigger the dashboard's reload.
+	if isTerminal(j.state) && t.now().Sub(j.at) > jobRetention {
+		delete(t.jobs, id)
+		return job{}, false
+	}
+	return j, true
 }
 
 func (t *jobTracker) active(id string) bool {
@@ -407,11 +433,12 @@ func (s *server) renderService(w http.ResponseWriter, r *http.Request, id string
 		}
 	}
 	backups, _ := s.cfg.DB.ListBackups(id)
-	isMinio := services.Kind(svc.Kind) == services.KindMinio
-	var minioBuckets []string
+	isGarage := services.Kind(svc.Kind) == services.KindGarage
+	var garageBuckets []string
 	enabledBuckets := map[string]bool{}
-	minioErr := ""
-	if isMinio {
+	garageErr := ""
+	garageEndpoint, garageAccess, garageSecret := "", "", ""
+	if isGarage {
 		enabled, _ := parseBucketList(items[bucketBackupKey])
 		for _, b := range enabled {
 			enabledBuckets[b] = true
@@ -419,12 +446,12 @@ func (s *server) renderService(w http.ResponseWriter, r *http.Request, id string
 		detected := []string{}
 		if s.cfg.BackupDir != "" && s.cfg.DockerRaw != nil {
 			bs := s.backupService()
-			mc, merr := bs.minioClient(id)
+			mc, merr := bs.s3Client(id)
 			if merr == nil {
-				if list, lerr := docker.ListMinioBuckets(s.cfg.DockerRaw, mc); lerr == nil {
+				if list, lerr := docker.ListS3Buckets(s.cfg.DockerRaw, mc); lerr == nil {
 					detected = list
 				} else {
-					minioErr = "could not list buckets (is the service running?)"
+					garageErr = "could not list buckets (is the service running?)"
 				}
 			}
 		}
@@ -440,7 +467,26 @@ func (s *server) renderService(w http.ResponseWriter, r *http.Request, id string
 		for _, b := range all {
 			if !seen[b] {
 				seen[b] = true
-				minioBuckets = append(minioBuckets, b)
+				garageBuckets = append(garageBuckets, b)
+			}
+		}
+		// Externally reachable S3 endpoint + auto-generated credentials so the
+		// operator can point an S3 client at the service without reading logs.
+		if host := strings.TrimSpace(items[garageHostnameKey]); host != "" {
+			garageEndpoint = host + ":3900"
+		} else {
+			garageEndpoint = id + "-garage-1:3900"
+		}
+		garageAccess = items[garageAccessKeyKey]
+		garageSecret = ""
+		if raw := items[garageSecretKeyKey]; raw != "" {
+			if s.cfg.Cipher != nil {
+				if dec, derr := s.cfg.Cipher.Decrypt(raw); derr == nil {
+					garageSecret = dec
+				}
+			}
+			if garageSecret == "" {
+				garageSecret = raw
 			}
 		}
 	}
@@ -461,10 +507,14 @@ func (s *server) renderService(w http.ResponseWriter, r *http.Request, id string
 		BackupConfigured: s.cfg.BackupDir != "",
 		BackupSchedule:   items[backupScheduleKey],
 		BackupSchedules:  []string{"inherit", "off", "@hourly", "daily", "weekly"},
-		IsMinio:          isMinio,
-		MinioBuckets:     minioBuckets,
+		IsGarage:         isGarage,
+		GarageBuckets:    garageBuckets,
 		EnabledBuckets:   enabledBuckets,
-		MinioBucketsErr:  minioErr,
+		GarageBucketsErr: garageErr,
+		GarageEndpoint:   garageEndpoint,
+		GarageAccessKey:  garageAccess,
+		GarageSecret:     garageSecret,
+		GarageSecretSet:  garageSecret != "",
 	})
 }
 
@@ -487,15 +537,21 @@ type svcData struct {
 	BackupConfigured bool
 	BackupSchedule   string // per-service schedule selector value
 	BackupSchedules  []string
-	// Minio per-bucket backup toggles: IsMinio flags the kind, MinioBuckets is
-	// the bucket names detected on the running server (may be empty when the
+	// Garage per-bucket backup toggles: IsGarage flags the kind, GarageBuckets
+	// is the bucket names detected on the running server (may be empty when the
 	// service is down), EnabledBuckets is the set the user has chosen, and
-	// MinioBucketsErr reports a detection failure (server unreachable) so the
+	// GarageBucketsErr reports a detection failure (server unreachable) so the
 	// UI can show an offline note instead of silently hiding the section.
-	IsMinio         bool
-	MinioBuckets    []string
-	EnabledBuckets  map[string]bool
-	MinioBucketsErr string
+	IsGarage         bool
+	GarageBuckets    []string
+	EnabledBuckets   map[string]bool
+	GarageBucketsErr string
+	// GarageConnection surfaces the S3 endpoint + auto-generated credentials for
+	// a garage service so they can be copied without peeking at docker logs.
+	GarageEndpoint  string
+	GarageAccessKey string
+	GarageSecret    string // plaintext, masked by default; revealed on demand
+	GarageSecretSet bool
 }
 
 // hasSizeField reports whether a definition declares a FieldSize field (i.e. a
@@ -633,14 +689,14 @@ func (s *server) saveService(w http.ResponseWriter, r *http.Request) {
 		schedule = "inherit"
 	}
 	items = append(items, db.ConfigItem{Key: backupScheduleKey, Value: schedule})
-	// Minio-only: the set of buckets to back up, given by the "minio_bucket_<n>"
+	// Garage-only: the set of buckets to back up, given by the "garage_bucket_<n>"
 	// checkboxes (value = bucket name). Empty ⇒ fall back to the whole-volume
 	// snapshot. Form field order is stable, so sorting the names keeps the
 	// stored list deterministic for rendering.
-	if def.Kind == services.KindMinio {
+	if def.Kind == services.KindGarage {
 		var enabled []string
 		for key, vs := range r.Form {
-			if !strings.HasPrefix(key, "minio_bucket_") || len(vs) == 0 || vs[0] == "" {
+			if !strings.HasPrefix(key, "garage_bucket_") || len(vs) == 0 || vs[0] == "" {
 				continue
 			}
 			enabled = append(enabled, vs[len(vs)-1])
@@ -657,15 +713,15 @@ func (s *server) saveService(w http.ResponseWriter, r *http.Request) {
 	// size, and EnsureVolume applies it on the next `up`. Either way a size the
 	// disk can't fit is rejected here up front.
 	if namedVolume, ok := resizeVolumeNames[def.Kind]; ok {
-		newSize := values["MINIO_VOLUME_SIZE"]
-		if newSize != "" && newSize != existing["MINIO_VOLUME_SIZE"] {
+		newSize := values["GARAGE_VOLUME_SIZE"]
+		if newSize != "" && newSize != existing["GARAGE_VOLUME_SIZE"] {
 			if _, _, msg, ok := s.sizePreflight(dir, id, newSize); !ok {
 				s.renderService(w, r, id, msg, true)
 				return
 			}
 			if s.cfg.DockerRaw != nil {
 				cfg, _ := s.cfg.DB.ConfigItems(id)
-				currentName := cfg["MINIO_VOLUME_NAME"]
+				currentName := cfg["GARAGE_VOLUME_NAME"]
 				if currentName == "" {
 					currentName = docker.VolumeName(dir, namedVolume)
 				}
@@ -827,6 +883,9 @@ func (s *server) serviceAction(w http.ResponseWriter, r *http.Request) {
 		_, err = docker.Down(dir, s.cfg.Docker)
 	case "restart":
 		_, err = docker.Restart(dir, s.cfg.Docker)
+		if err == nil && def.Kind == services.KindGarage {
+			err = s.postUpGarage(id)
+		}
 	}
 	if err != nil {
 		http.Error(w, err.Error(), 500)
@@ -883,11 +942,11 @@ func (s *server) upService(id string) error {
 	defer render.RemoveEnvFile(dir)
 	if s.cfg.DockerRaw != nil {
 		if namedVolume, ok := resizeVolumeNames[def.Kind]; ok {
-			name := values["MINIO_VOLUME_NAME"]
+			name := values["GARAGE_VOLUME_NAME"]
 			if name == "" {
 				name = docker.VolumeName(dir, namedVolume)
 			}
-			size := values["MINIO_VOLUME_SIZE"]
+			size := values["GARAGE_VOLUME_SIZE"]
 			if size == "" {
 				size = "100G"
 			}
@@ -902,7 +961,15 @@ func (s *server) upService(id string) error {
 		}
 	}
 	_, err = docker.Up(dir, s.cfg.Docker)
-	return err
+	if err != nil {
+		return err
+	}
+	if def.Kind == services.KindGarage {
+		if perr := s.postUpGarage(id); perr != nil {
+			return perr
+		}
+	}
+	return nil
 }
 
 // AutoStart starts every service flagged "start on boot", in a background
@@ -1005,13 +1072,13 @@ func (s *server) deleteService(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Remove the service-owned resizeable data volume (and its data). Blinding
-	// deletion of a minio volume would leak the data; removing it is the change
+	// deletion of a garage volume would leak the data; removing it is the change
 	// the user opted into.
 	if s.cfg.DockerRaw != nil {
 		if namedVolume, ok := resizeVolumeNames[services.Kind(svc.Kind)]; ok {
 			name := ""
 			if items, err := s.cfg.DB.ConfigItems(id); err == nil {
-				name = items["MINIO_VOLUME_NAME"]
+				name = items["GARAGE_VOLUME_NAME"]
 			}
 			if name == "" {
 				name = docker.VolumeName(dir, namedVolume)
@@ -1071,7 +1138,7 @@ const autostartKey = "autostart"
 // compose file) whose size may be resized. Only services that declare a
 // size-limited named volume are resizable; others return an error.
 var resizeVolumeNames = map[services.Kind]string{
-	services.KindMinio: "minio_data",
+	services.KindGarage: "garage_data",
 }
 
 // prepareFns maps kinds needing a launch-time step run right before
@@ -1084,6 +1151,247 @@ var prepareFns = map[services.Kind]func(s *server, id, dir string, values map[st
 	services.KindMailcow:     prepareMailcow,
 	services.KindPostgres:    preparePostgres,
 	services.KindVault:       prepareVault,
+	services.KindGarage:      prepareGarage,
+}
+
+// prepareGarage materializes the garage.toml the compose mounts and ensures the
+// S3 access key exists (auto-generating and persisting it on first launch so
+// subsequent starts and backups can reuse it). The compose starts the container
+// on the final `up`, so the key generation here only fills values; the actual
+// garage-instance set-up (layout, bucket, key upload) is validated lazily during
+// backup/listing against the running service.
+func prepareGarage(s *server, id, dir string, values map[string]string) error {
+	items, err := s.cfg.DB.ConfigItems(id)
+	if err != nil {
+		return err
+	}
+	rpcSecret := ensureGarageRPCSecret(s, id, items)
+	if err := writeGarageConfig(dir, values, rpcSecret); err != nil {
+		return err
+	}
+	return ensureGarageKey(s, id, items)
+}
+
+// garageToml renders the single-node Garage configuration the container mounts
+// at /etc/garage.toml. meta and data live as subdirectories of the single data
+// volume mounted at /srv/garage. sqlite is used for the metadata DB as it is
+// more corruption-resistant on unclean shutdowns than the default LMDB. The
+// S3/web root_domain is derived from the configured GARAGE_HOSTNAME (falling
+// back to a local placeholder), s3_region is cosmetic (Garage only echoes it),
+// and rpc_secret is a required 32-byte hex key.
+func garageToml(hostname, region, rpcSecret string) string {
+	rootDomain := "s3.mitia.local"
+	if hostname != "" {
+		rootDomain = hostname
+	}
+	if region == "" {
+		region = "eu-west-1"
+	}
+	if rpcSecret == "" {
+		rpcSecret = strings.Repeat("0", 32)
+	}
+	return fmt.Sprintf(`metadata_dir = "/srv/garage/meta"
+data_dir = "/srv/garage/data"
+db_engine = "sqlite"
+metadata_auto_snapshot_interval = "6h"
+
+replication_factor = 1
+
+compression_level = 2
+
+rpc_bind_addr = "[::]:3901"
+rpc_secret = %q
+
+[s3_api]
+s3_region = %q
+api_bind_addr = "[::]:3900"
+root_domain = %q
+
+[s3_web]
+bind_addr = "[::]:3902"
+root_domain = %q
+index = "index.html"
+`, rpcSecret, region, rootDomain, rootDomain)
+}
+
+// writeGarageConfig writes garage.toml into the deploy dir so the compose bind
+// mount (./garage.toml) picks it up.
+func writeGarageConfig(dir string, values map[string]string, rpcSecret string) error {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(dir, "garage.toml"), []byte(garageToml(values[garageHostnameKey], strings.TrimSpace(values[garageRegionKey]), rpcSecret)), 0o644)
+}
+
+// garageCredentialKeys are the config keys holding the auto-generated S3 access
+// key/secret (secret encrypted) and the cluster RPC secret.
+const (
+	garageHostnameKey  = "GARAGE_HOSTNAME"
+	garageRegionKey    = "GARAGE_S3_REGION"
+	garageAccessKeyKey = "GARAGE_ACCESS_KEY_ID"
+	garageSecretKeyKey = "GARAGE_SECRET_ACCESS_KEY"
+	garageRPCSecretKey = "GARAGE_RPC_SECRET"
+)
+
+// randomHex returns n random bytes as a lowercase hex string (2n characters),
+// used for the Garage RPC secret which must be a 32-byte hex value.
+func randomHex(n int) string {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		panic(fmt.Sprintf("randomHex: %v", err)) // never expected from the OS CSPRNG
+	}
+	return hex.EncodeToString(b)
+}
+
+// ensureGarageRPCSecret returns the plaintext RPC secret used in garage.toml,
+// generating and persisting (encrypted) a fresh one on first launch so the
+// config is stable across regenerations and matches the running cluster.
+func ensureGarageRPCSecret(s *server, id string, items map[string]string) string {
+	if raw := items[garageRPCSecretKey]; raw != "" {
+		if s.cfg.Cipher != nil {
+			if dec, err := s.cfg.Cipher.Decrypt(raw); err == nil {
+				return dec
+			}
+		}
+		return raw
+	}
+	secret := randomHex(32)
+	stored := secret
+	if s.cfg.Cipher != nil {
+		if enc, err := s.cfg.Cipher.Encrypt(secret); err == nil {
+			stored = enc
+		}
+	}
+	if err := s.cfg.DB.SetConfigItems(id, []db.ConfigItem{{Key: garageRPCSecretKey, Value: stored}}); err != nil {
+		return secret
+	}
+	return secret
+}
+
+// ensureGarageKey generates a fresh S3 key pair on first launch and persists it
+// (encrypted secret) so it is stable across restarts and available to backups.
+// On subsequent launches it is a no-op. The key is uploaded to the instance
+// during set-up rather than here because it must be created via the running
+// container's `garage key create` once the daemon is reachable.
+func ensureGarageKey(s *server, id string, items map[string]string) error {
+	if items[garageAccessKeyKey] != "" {
+		return nil
+	}
+	secret := strings.ReplaceAll(newID(), "-", "")
+	access := "mitia-" + secret[:16]
+	if s.cfg.Cipher != nil {
+		if enc, err := s.cfg.Cipher.Encrypt(secret); err == nil {
+			secret = enc
+		}
+	}
+	return s.cfg.DB.SetConfigItems(id, []db.ConfigItem{
+		{Key: garageAccessKeyKey, Value: access},
+		{Key: garageSecretKeyKey, Value: secret},
+	})
+}
+
+// postUpGarage completes a garage service's first-boot cluster setup once the
+// containers are up and the daemon is reachable. Garage refuses to serve any
+// S3 request until its single node has been assigned a role (layout assign +
+// apply); even then, the auto-generated access key must be registered in the
+// instance (key import) and granted rights. Without this, bucket detection and
+// per-bucket backups fail with "Layout not ready"/access-key errors even though
+// the container is running. Every step is idempotent, so repeated up/restart
+// calls are safe.
+func (s *server) postUpGarage(id string) error {
+	if s.cfg.DockerRaw == nil {
+		return nil
+	}
+	items, err := s.cfg.DB.ConfigItems(id)
+	if err != nil {
+		return err
+	}
+	container := id + "-garage-1"
+
+	// 1. Give the single node a role and apply the cluster layout. This only
+	// runs while the layout is still empty (a fresh install or an evolved data
+	// volume); once a role exists the layout is left alone.
+	if show, _ := docker.GarageCLI(s.cfg.DockerRaw, container, "layout", "show"); strings.Contains(show, "No nodes currently have a role") {
+		nodeID := garageNodeID(s.cfg.DockerRaw, container)
+		if nodeID == "" {
+			return fmt.Errorf("garage: could not determine node id")
+		}
+		// A single node must be given a role with a declared capacity. The
+		// capacity only weights partition placement (irrelevant with a single
+		// node), so a generous fixed value is used.
+		if _, err := docker.GarageCLI(s.cfg.DockerRaw, container, "layout", "assign", "-z", "dc1", "-c", "1TB", nodeID); err != nil {
+			return fmt.Errorf("garage layout assign: %w", err)
+		}
+		// `garage layout apply` requires the new version number (current + 1).
+		ver := garageNextLayoutVersion(show)
+		if ver == "" {
+			return fmt.Errorf("garage: could not determine layout version")
+		}
+		if _, err := docker.GarageCLI(s.cfg.DockerRaw, container, "layout", "apply", "--version", ver); err != nil {
+			return fmt.Errorf("garage layout apply: %w", err)
+		}
+	}
+
+	// 2. Register the auto-generated key with mitia-ops's known secret so mc
+	// and the per-bucket backups authenticate (re-import is idempotent).
+	access := items[garageAccessKeyKey]
+	secret := items[garageSecretKeyKey]
+	if s.cfg.Cipher != nil && secret != "" {
+		if dec, derr := s.cfg.Cipher.Decrypt(secret); derr == nil {
+			secret = dec
+		}
+	}
+	if access == "" || secret == "" {
+		return nil
+	}
+	if _, err := docker.GarageCLI(s.cfg.DockerRaw, container, "key", "import", "-n", "mitia-ops-"+id, "--yes", access, secret); err != nil {
+		return fmt.Errorf("garage key import: %w", err)
+	}
+	if _, err := docker.GarageCLI(s.cfg.DockerRaw, container, "key", "allow", access, "--create-bucket"); err != nil {
+		return fmt.Errorf("garage key allow: %w", err)
+	}
+
+	// 3. Grant read/write on the buckets the operator opted into backing up.
+	buckets, _ := parseBucketList(items[bucketBackupKey])
+	for _, b := range buckets {
+		if _, err := docker.GarageCLI(s.cfg.DockerRaw, container, "bucket", "allow", b, "--key", access, "--read", "--write"); err != nil {
+			return fmt.Errorf("garage bucket allow %s: %w", b, err)
+		}
+	}
+	return nil
+}
+
+// garageNodeID extracts a node's identifier from `garage node id`, whose first
+// non-annotated line is the node's 64-character lowercase hex id.
+func garageNodeID(raw docker.RawRunner, container string) string {
+	out, err := docker.GarageCLI(raw, container, "node", "id")
+	if err != nil {
+		return ""
+	}
+	var idRe = regexp.MustCompile(`[0-9a-f]{64}`)
+	for _, line := range strings.Split(out, "\n") {
+		if m := idRe.FindString(line); m != "" {
+			return m
+		}
+	}
+	return ""
+}
+
+var layoutVersionRe = regexp.MustCompile(`Current cluster layout version:\s*(\d+)`)
+
+// garageNextLayoutVersion returns the version string to pass to `garage layout
+// apply`, which requires the new version number (the current version plus one)
+// to avoid clobbering concurrent changes. Parsed from `garage layout show`.
+func garageNextLayoutVersion(show string) string {
+	m := layoutVersionRe.FindStringSubmatch(show)
+	if len(m) != 2 {
+		return ""
+	}
+	n, err := strconv.Atoi(m[1])
+	if err != nil {
+		return ""
+	}
+	return strconv.Itoa(n + 1)
 }
 
 // preparePostgres enforces the volume-size guard at launch: when a
@@ -1576,7 +1884,7 @@ func seedMailcowSelfSignedCert(dir string) error {
 	return nil
 }
 
-// injectVolumeName adds the MINIO_VOLUME_NAME the compose should mount to
+// injectVolumeName adds the GARAGE_VOLUME_NAME the compose should mount to
 // values, using the stored name if present (after a resize) or the
 // compose-default project-scoped name for the service's resizeable volume.
 // Called wherever the compose is rendered so the external volume always points
@@ -1586,22 +1894,22 @@ func (s *server) injectVolumeName(dir string, id string, kind services.Kind, val
 	if !ok {
 		return
 	}
-	if values["MINIO_VOLUME_NAME"] != "" {
+	if values["GARAGE_VOLUME_NAME"] != "" {
 		return
 	}
 	current := ""
 	if items, err := s.cfg.DB.ConfigItems(id); err == nil {
-		current = items["MINIO_VOLUME_NAME"]
+		current = items["GARAGE_VOLUME_NAME"]
 	}
 	if current == "" {
 		current = docker.VolumeName(dir, namedVolume)
 	}
-	values["MINIO_VOLUME_NAME"] = current
+	values["GARAGE_VOLUME_NAME"] = current
 }
 
 // sizePreflight validates a requested volume size string against the free space
 // on dir's filesystem, counting every OTHER service's declared volume size: all
-// sized services (minio, postgres, …) claim the same disk, so one service's
+// sized services (garage, postgres, …) claim the same disk, so one service's
 // guard must fail when the others have already declared sizes it can't host.
 // It returns the resized byte count and ok=true when everything fits, or a
 // non-200 http status plus a human-readable message otherwise (400 for an
@@ -1669,7 +1977,7 @@ func (s *server) doResize(w http.ResponseWriter, r *http.Request, id string, def
 		http.Error(w, "volume resize not supported by this Docker runner", 500)
 		return
 	}
-	newSize := values["MINIO_VOLUME_SIZE"]
+	newSize := values["GARAGE_VOLUME_SIZE"]
 	// Pre-flight free-space check: the resize must fit the full new volume plus
 	// a buffer, so it fails before stopping the service or touching any data.
 	if _, status, msg, ok := s.sizePreflight(dir, id, newSize); !ok {
@@ -1677,10 +1985,10 @@ func (s *server) doResize(w http.ResponseWriter, r *http.Request, id string, def
 		return
 	}
 
-	// Current volume name: tracked via MINIO_VOLUME_NAME after a prior resize,
+	// Current volume name: tracked via GARAGE_VOLUME_NAME after a prior resize,
 	// otherwise the compose-default project-scoped name.
 	cfg, _ := s.cfg.DB.ConfigItems(id)
-	currentName := cfg["MINIO_VOLUME_NAME"]
+	currentName := cfg["GARAGE_VOLUME_NAME"]
 	if currentName == "" {
 		currentName = docker.VolumeName(dir, namedVolume)
 	}
@@ -1736,14 +2044,14 @@ func (s *server) doResize(w http.ResponseWriter, r *http.Request, id string, def
 	// name), then re-render compose to reference the new external volume.
 	cfgItems := append([]db.ConfigItem{}, items...)
 	cfgItems = append(cfgItems,
-		db.ConfigItem{Key: "MINIO_VOLUME_NAME", Value: newName},
-		db.ConfigItem{Key: "MINIO_VOLUME_SIZE", Value: newSize},
+		db.ConfigItem{Key: "GARAGE_VOLUME_NAME", Value: newName},
+		db.ConfigItem{Key: "GARAGE_VOLUME_SIZE", Value: newSize},
 	)
 	if err := s.cfg.DB.SetConfigItems(id, cfgItems); err != nil {
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	values["MINIO_VOLUME_NAME"] = newName
+	values["GARAGE_VOLUME_NAME"] = newName
 	res, err := render.BuildRenderResult(def.Kind, values)
 	if err != nil {
 		http.Error(w, err.Error(), 500)

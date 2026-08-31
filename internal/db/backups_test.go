@@ -39,8 +39,8 @@ func TestBackupsCascadeOnServiceDelete(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer d.Close()
-	sid, _ := d.CreateService("minio", "m")
-	if err := d.CreateBackup(Backup{ID: "x", ServiceID: sid, Kind: "minio", Filename: "f"}); err != nil {
+	sid, _ := d.CreateService("garage", "m")
+	if err := d.CreateBackup(Backup{ID: "x", ServiceID: sid, Kind: "garage", Filename: "f"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := d.DeleteService(sid); err != nil {
@@ -60,9 +60,9 @@ func TestListBackupsNewestFirst(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer d.Close()
-	sid, _ := d.CreateService("minio", "m")
-	_ = d.CreateBackup(Backup{ID: "a", ServiceID: sid, Kind: "minio", Filename: "a", CreatedAt: "2026-01-01T00:00:00Z"})
-	_ = d.CreateBackup(Backup{ID: "b", ServiceID: sid, Kind: "minio", Filename: "b", CreatedAt: "2026-06-01T00:00:00Z"})
+	sid, _ := d.CreateService("garage", "m")
+	_ = d.CreateBackup(Backup{ID: "a", ServiceID: sid, Kind: "garage", Filename: "a", CreatedAt: "2026-01-01T00:00:00Z"})
+	_ = d.CreateBackup(Backup{ID: "b", ServiceID: sid, Kind: "garage", Filename: "b", CreatedAt: "2026-06-01T00:00:00Z"})
 	list, _ := d.ListBackups(sid)
 	if len(list) != 2 || list[0].ID != "b" || list[1].ID != "a" {
 		t.Fatalf("ListBackups should be newest first, got %v", list)
@@ -75,8 +75,8 @@ func TestDeleteBackupsByService(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer d.Close()
-	sid, _ := d.CreateService("minio", "m")
-	_ = d.CreateBackup(Backup{ID: "a", ServiceID: sid, Kind: "minio", Filename: "a"})
+	sid, _ := d.CreateService("garage", "m")
+	_ = d.CreateBackup(Backup{ID: "a", ServiceID: sid, Kind: "garage", Filename: "a"})
 	if err := d.DeleteBackupsByService(sid); err != nil {
 		t.Fatal(err)
 	}

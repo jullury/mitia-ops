@@ -341,3 +341,40 @@ func (d *DB) CompleteMigrations() error {
 	_, err := d.db.Exec("DELETE FROM migrated_ids")
 	return err
 }
+
+// MigrateMinioToGarage converts legacy "minio" services to the "garage" kind and
+// migrates their config keys to the GARAGE_* namespace. Keys with no Garage
+// equivalent (root user/password, console URL) are dropped; the access key is
+// auto-generated on the service's next launch. Idempotent: a second run is a
+// no-op because no kind="minio" rows remain.
+func (d *DB) MigrateMinioToGarage() error {
+	tx, err := d.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec("UPDATE services SET kind = 'garage' WHERE kind = 'minio'"); err != nil {
+		return err
+	}
+	rename := map[string]string{
+		"MINIO_HOSTNAME":       "GARAGE_HOSTNAME",
+		"MINIO_VOLUME_SIZE":    "GARAGE_VOLUME_SIZE",
+		"MINIO_VOLUME_NAME":    "GARAGE_VOLUME_NAME",
+		"minio_backup_buckets": "garage_backup_buckets",
+	}
+	for from, to := range rename {
+		if _, err := tx.Exec("UPDATE config_items SET key = ? WHERE key = ?", to, from); err != nil {
+			return err
+		}
+	}
+	// Keys with no Garage counterpart: the old root/console credentials are not
+	// used (Garage uses an auto-generated access key pair).
+	dropped := []string{"MINIO_ROOT_USER", "MINIO_ROOT_PASSWORD", "MINIO_CONSOLE_URL"}
+	for _, k := range dropped {
+		if _, err := tx.Exec("DELETE FROM config_items WHERE key = ?", k); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}

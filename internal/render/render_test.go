@@ -117,12 +117,12 @@ func TestBuildRenderResultEmptyForMailcow(t *testing.T) {
 }
 
 func TestBuildRenderResultDotEnvFallbackWhenRendererEmitsNone(t *testing.T) {
-	res, err := BuildRenderResult(services.KindMinio, map[string]string{"EXTRA": "1"})
+	res, err := BuildRenderResult(services.KindGarage, map[string]string{"EXTRA": "1"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if strings.TrimSpace(res.ComposeYAML) == "" {
-		t.Fatal("minio must carry a compose payload for the fallback to engage")
+		t.Fatal("garage must carry a compose payload for the fallback to engage")
 	}
 	if !strings.Contains(res.DotEnv, "EXTRA=1") {
 		t.Fatalf("fallback must fill DotEnv from values even when the renderer emits none, got %q", res.DotEnv)

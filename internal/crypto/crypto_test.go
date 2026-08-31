@@ -7,18 +7,18 @@ func TestRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	enc, err := c.Encrypt("MINIO_ROOT_PASSWORD=hunter2")
+	enc, err := c.Encrypt("GARAGE_SECRET_ACCESS_KEY=hunter2")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if enc == "MINIO_ROOT_PASSWORD=hunter2" {
+	if enc == "GARAGE_SECRET_ACCESS_KEY=hunter2" {
 		t.Fatal("ciphertext should not equal plaintext")
 	}
 	dec, err := c.Decrypt(enc)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if dec != "MINIO_ROOT_PASSWORD=hunter2" {
+	if dec != "GARAGE_SECRET_ACCESS_KEY=hunter2" {
 		t.Fatalf("round trip failed: got %q", dec)
 	}
 }

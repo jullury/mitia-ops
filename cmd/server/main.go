@@ -23,12 +23,12 @@ import (
 // project-scoped and thus embedded in the rendered compose as an external
 // volume name that follows the deploy dir (i.e. the service id).
 var resizeVolumeNames = map[services.Kind]string{
-	services.KindMinio: "minio_data",
+	services.KindGarage: "garage_data",
 }
 
 // regenerateCompose re-renders the deployment file for a service whose compose
-// pins a project-scoped external volume name (e.g. the minio compose mounts
-// `name: <id>_minio_data`). The compose on disk predates the id change and
+// pins a project-scoped external volume name (e.g. the garage compose mounts
+// `name: <id>_garage_data`). The compose on disk predates the id change and
 // would still mount the old name, so it is derived again from stored config
 // with the volume reference pointing at the migrated (relocated) volume.
 func regenerateCompose(d *db.DB, dir, id string) error {
@@ -48,11 +48,11 @@ func regenerateCompose(d *db.DB, dir, id string) error {
 	if err != nil {
 		return err
 	}
-	name := values["MINIO_VOLUME_NAME"]
+	name := values["GARAGE_VOLUME_NAME"]
 	if name == "" {
 		name = docker.VolumeName(dir, namedVolume)
 	}
-	values["MINIO_VOLUME_NAME"] = name
+	values["GARAGE_VOLUME_NAME"] = name
 	res, err := render.BuildRenderResult(def.Kind, values)
 	if err != nil {
 		return err
@@ -66,7 +66,7 @@ func regenerateCompose(d *db.DB, dir, id string) error {
 // migrated_ids (a no-op on a schema that already uses TEXT ids) — then the
 // on-disk half: bring the stack down, rename the deploy directory to the UUID,
 // and relocate every project-scoped Docker volume (which embeds the id, e.g.
-// "4_minio_data", "4_mysql-vol-1") so application data survives. Each step
+// "4_garage_data", "4_mysql-vol-1") so application data survives. Each step
 // skips gracefully when the source is already gone, so a crash mid-way just
 // picks up where it left off on the next boot. The migrated_ids rows are the
 // resume marker and are cleared only once every volume has been relocated.
@@ -105,7 +105,7 @@ func migrateLegacyServices(d *db.DB, deployDir string, runner docker.Runner, raw
 		}
 
 		// Re-derive the rendered deployment file so any id-embedding external
-		// volume reference (minio's compose) points at the relocated volume.
+		// volume reference (garage's compose) points at the relocated volume.
 		if err := regenerateCompose(d, newDir, newID); err != nil {
 			log.Printf("migration: regenerate compose for %s: %v", newID, err)
 			allDone = false
@@ -207,6 +207,12 @@ func main() {
 	cli := docker.NewCLI()
 
 	if err := migrateLegacyServices(d, deployDir, cli, cli); err != nil {
+		log.Fatal(err)
+	}
+	// Convert any pre-existing minio services to garage (kind + config keys).
+	// The old minio data is not imported — Garage's on-disk format differs — so
+	// migrated services must re-seed their buckets after their first launch.
+	if err := d.MigrateMinioToGarage(); err != nil {
 		log.Fatal(err)
 	}
 

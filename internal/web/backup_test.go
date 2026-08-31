@@ -129,7 +129,7 @@ func TestBackupRunWritesSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer d.Close()
-	sid, _ := d.CreateService("minio", "m")
+	sid, _ := d.CreateService("garage", "m")
 	deployDir := t.TempDir()
 	svcDir := filepath.Join(deployDir, sid)
 	_ = os.MkdirAll(svcDir, 0o755)
@@ -153,7 +153,7 @@ func TestBackupRunWritesSnapshot(t *testing.T) {
 	if filename == "" {
 		t.Fatal("expected a backup filename")
 	}
-	if !strings.HasSuffix(filename, "-minio.tar.gz") {
+	if !strings.HasSuffix(filename, "-garage.tar.gz") {
 		t.Fatalf("unexpected filename %q", filename)
 	}
 	rows, err := d.ListBackups(sid)
@@ -168,20 +168,20 @@ func TestBackupRunWritesSnapshot(t *testing.T) {
 	}
 }
 
-// TestBackupRunResolvesExternalMinioVolume checks the tracked MINIO_VOLUME_NAME
+// TestBackupRunResolvesExternalGarageVolume checks the tracked GARAGE_VOLUME_NAME
 // wins over the project-scoped default when set.
-func TestBackupRunResolvesExternalMinioVolume(t *testing.T) {
+func TestBackupRunResolvesExternalGarageVolume(t *testing.T) {
 	d, err := db.Open(filepath.Join(t.TempDir(), "t.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer d.Close()
-	sid, _ := d.CreateService("minio", "m")
+	sid, _ := d.CreateService("garage", "m")
 	deployDir := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(deployDir, sid), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := d.SetConfigItems(sid, []db.ConfigItem{{Key: "MINIO_VOLUME_NAME", Value: "external_vol"}}); err != nil {
+	if err := d.SetConfigItems(sid, []db.ConfigItem{{Key: "GARAGE_VOLUME_NAME", Value: "external_vol"}}); err != nil {
 		t.Fatal(err)
 	}
 	raw := &fakeSnapshotRunner{}
@@ -197,20 +197,20 @@ func TestBackupRunResolvesExternalMinioVolume(t *testing.T) {
 	}
 	joined := strings.Join(raw.ran, " ")
 	if !strings.Contains(joined, "external_vol:/snap/volumes/external_vol:ro") {
-		t.Fatalf("minio external volume should be captured: %v", joined)
+		t.Fatalf("garage external volume should be captured: %v", joined)
 	}
 }
 
-// TestBackupRunMinioMirrorsConfiguredBuckets checks that when buckets are
+// TestBackupRunGarageMirrorsConfiguredBuckets checks that when buckets are
 // configured, the backup mirrors each bucket logically and folds them into the
 // snapshot, instead of relying solely on the physical volume.
-func TestBackupRunMinioMirrorsConfiguredBuckets(t *testing.T) {
+func TestBackupRunGarageMirrorsConfiguredBuckets(t *testing.T) {
 	d, err := db.Open(filepath.Join(t.TempDir(), "t.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer d.Close()
-	sid, _ := d.CreateService("minio", "m")
+	sid, _ := d.CreateService("garage", "m")
 	deployDir := t.TempDir()
 	svcDir := filepath.Join(deployDir, sid)
 	_ = os.MkdirAll(svcDir, 0o755)
@@ -219,8 +219,8 @@ func TestBackupRunMinioMirrorsConfiguredBuckets(t *testing.T) {
 	enc, _ := c.Encrypt("secretpass")
 	if err := d.SetConfigItems(sid, []db.ConfigItem{
 		{Key: bucketBackupKey, Value: "photos, docs"},
-		{Key: "MINIO_ROOT_USER", Value: "minioadmin"},
-		{Key: "MINIO_ROOT_PASSWORD", Value: enc},
+		{Key: "GARAGE_ACCESS_KEY_ID", Value: "itGARAGE"},
+		{Key: "GARAGE_SECRET_ACCESS_KEY", Value: enc},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -243,20 +243,20 @@ func TestBackupRunMinioMirrorsConfiguredBuckets(t *testing.T) {
 	if !strings.Contains(joined, "mitia/photos") || !strings.Contains(joined, "mitia/docs") {
 		t.Fatalf("mirror should target configured buckets: %v", raw.ran)
 	}
-	if !strings.Contains(joined, ".minio:/snap/minio:ro") {
-		t.Fatalf("snapshot should bundle the minio bucket stage: %v", joined)
+	if !strings.Contains(joined, ".s3:/snap/s3:ro") {
+		t.Fatalf("snapshot should bundle the garage bucket stage: %v", joined)
 	}
 }
 
-// TestBackupRunMinioNoBucketsFallsBackToVolume checks that without configured
+// TestBackupRunGarageNoBucketsFallsBackToVolume checks that without configured
 // buckets the backup takes the whole-volume snapshot and never runs mc.
-func TestBackupRunMinioNoBucketsFallsBackToVolume(t *testing.T) {
+func TestBackupRunGarageNoBucketsFallsBackToVolume(t *testing.T) {
 	d, err := db.Open(filepath.Join(t.TempDir(), "t.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer d.Close()
-	sid, _ := d.CreateService("minio", "m")
+	sid, _ := d.CreateService("garage", "m")
 	deployDir := t.TempDir()
 	_ = os.MkdirAll(filepath.Join(deployDir, sid), 0o755)
 	raw := &fakeSnapshotRunner{}
@@ -325,7 +325,7 @@ func newServiceTestApp(t *testing.T, kind string) (*db.DB, http.Handler, string)
 }
 
 func TestManualBackupCreatesRow(t *testing.T) {
-	d, h, sid := newServiceTestApp(t, "minio")
+	d, h, sid := newServiceTestApp(t, "garage")
 	req := httptest.NewRequest("POST", "/service/"+sid+"/backup", nil)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
@@ -333,15 +333,15 @@ func TestManualBackupCreatesRow(t *testing.T) {
 		t.Fatalf("backup status %d: %s", rec.Code, rec.Body.String())
 	}
 	waitForBackup(t, d, sid, 1)
-	if rows, _ := d.ListBackups(sid); rows[0].Kind != "minio" || rows[0].Size <= 0 {
+	if rows, _ := d.ListBackups(sid); rows[0].Kind != "garage" || rows[0].Size <= 0 {
 		t.Fatalf("unexpected backup row: %+v", rows[0])
 	}
 }
 
-// TestServicePageListsMinioBuckets checks the service page renders a checkbox
+// TestServicePageListsGarageBuckets checks the service page renders a checkbox
 // per detected bucket so the operator can toggle which get backed up.
-func TestServicePageListsMinioBuckets(t *testing.T) {
-	_, h, sid := newServiceTestApp(t, "minio")
+func TestServicePageListsGarageBuckets(t *testing.T) {
+	_, h, sid := newServiceTestApp(t, "garage")
 	app := h.(*App)
 	app.s.cfg.DockerRaw.(*fakeSnapshotRunner).mcBuckets = []string{"photos", "docs", "archive"}
 	req := httptest.NewRequest("GET", "/service/"+sid, nil)
@@ -361,12 +361,12 @@ func TestServicePageListsMinioBuckets(t *testing.T) {
 // TestSaveServicePersistsEnabledBuckets checks saving the service persists the
 // checked buckets as the comma-separated backup list.
 func TestSaveServicePersistsEnabledBuckets(t *testing.T) {
-	d, h, sid := newServiceTestApp(t, "minio")
+	d, h, sid := newServiceTestApp(t, "garage")
 	app := h.(*App)
 	app.s.cfg.DockerRaw.(*fakeSnapshotRunner).mcBuckets = []string{"photos", "docs"}
 	form := url.Values{}
-	form.Set("minio_bucket_0", "photos")
-	form.Set("minio_bucket_1", "docs")
+	form.Set("garage_bucket_0", "photos")
+	form.Set("garage_bucket_1", "docs")
 	form.Set("backup_schedule", "inherit")
 	req := httptest.NewRequest("POST", "/service/"+sid, strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -381,7 +381,7 @@ func TestSaveServicePersistsEnabledBuckets(t *testing.T) {
 // TestSaveServiceNoBucketsClearsSelection checks that saving with no buckets
 // checked clears the backup list (falls back to the volume snapshot).
 func TestSaveServiceNoBucketsClearsSelection(t *testing.T) {
-	d, h, sid := newServiceTestApp(t, "minio")
+	d, h, sid := newServiceTestApp(t, "garage")
 	if err := d.SetConfigItems(sid, []db.ConfigItem{{Key: bucketBackupKey, Value: "photos"}}); err != nil {
 		t.Fatal(err)
 	}
@@ -403,16 +403,16 @@ func TestDownloadBackupServesFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer d.Close()
-	sid, _ := d.CreateService("minio", "m")
+	sid, _ := d.CreateService("garage", "m")
 	c, _ := crypto.New("master")
 	backupDir := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(backupDir, sid), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(backupDir, sid, "20260831T120000-minio.tar.gz"), []byte("SNAP"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(backupDir, sid, "20260831T120000-garage.tar.gz"), []byte("SNAP"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := d.CreateBackup(db.Backup{ID: "b1", ServiceID: sid, Kind: "minio", Filename: "20260831T120000-minio.tar.gz", Size: 4, CreatedAt: "2026-08-31T12:00:00Z"}); err != nil {
+	if err := d.CreateBackup(db.Backup{ID: "b1", ServiceID: sid, Kind: "garage", Filename: "20260831T120000-garage.tar.gz", Size: 4, CreatedAt: "2026-08-31T12:00:00Z"}); err != nil {
 		t.Fatal(err)
 	}
 	h := New(Config{DB: d, Cipher: c, DeployDir: t.TempDir(), Docker: &fakeRunner{}, BackupDir: backupDir, BackupSchedule: "off"})
@@ -425,21 +425,21 @@ func TestDownloadBackupServesFile(t *testing.T) {
 	if rec.Body.String() != "SNAP" {
 		t.Fatalf("download body = %q", rec.Body.String())
 	}
-	if cdisp := rec.Header().Get("Content-Disposition"); !strings.Contains(cdisp, "20260831T120000-minio.tar.gz") {
+	if cdisp := rec.Header().Get("Content-Disposition"); !strings.Contains(cdisp, "20260831T120000-garage.tar.gz") {
 		t.Fatalf("Content-Disposition = %q", cdisp)
 	}
 }
 
 func TestRestoreBackupGeneric(t *testing.T) {
-	d, h, sid := newServiceTestApp(t, "minio")
+	d, h, sid := newServiceTestApp(t, "garage")
 	if err := os.MkdirAll(filepath.Join(h.(*App).s.cfg.BackupDir, sid), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	fn := "20260831T120000-minio.tar.gz"
+	fn := "20260831T120000-garage.tar.gz"
 	if err := os.WriteFile(filepath.Join(h.(*App).s.cfg.BackupDir, sid, fn), []byte("SNAP"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := d.CreateBackup(db.Backup{ID: "b1", ServiceID: sid, Kind: "minio", Filename: fn, Size: 4, CreatedAt: "2026-08-31T12:00:00Z"}); err != nil {
+	if err := d.CreateBackup(db.Backup{ID: "b1", ServiceID: sid, Kind: "garage", Filename: fn, Size: 4, CreatedAt: "2026-08-31T12:00:00Z"}); err != nil {
 		t.Fatal(err)
 	}
 	req := httptest.NewRequest("POST", "/service/"+sid+"/backup/b1/restore", nil)
@@ -488,29 +488,29 @@ func TestRestoreBackupPostgresReimportsDump(t *testing.T) {
 	}
 }
 
-// TestRestoreBackupMinioRecreatesBuckets checks that a minio restore with
+// TestRestoreBackupGarageRecreatesBuckets checks that a garage restore with
 // configured buckets drops the volume, restarts the service, and repopulates
 // each bucket logically via mc (mb + mirror) rather than a physical overlay.
-func TestRestoreBackupMinioRecreatesBuckets(t *testing.T) {
-	d, h, sid := newServiceTestApp(t, "minio")
+func TestRestoreBackupGarageRecreatesBuckets(t *testing.T) {
+	d, h, sid := newServiceTestApp(t, "garage")
 	app := h.(*App)
 	c, _ := crypto.New("master")
 	enc, _ := c.Encrypt("secretpass")
 	if err := d.SetConfigItems(sid, []db.ConfigItem{
 		{Key: bucketBackupKey, Value: "photos"},
-		{Key: "MINIO_ROOT_USER", Value: "minioadmin"},
-		{Key: "MINIO_ROOT_PASSWORD", Value: enc},
+		{Key: "GARAGE_ACCESS_KEY_ID", Value: "itGARAGE"},
+		{Key: "GARAGE_SECRET_ACCESS_KEY", Value: enc},
 	}); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.MkdirAll(filepath.Join(app.s.cfg.BackupDir, sid), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	fn := "20260831T120000-minio.tar.gz"
+	fn := "20260831T120000-garage.tar.gz"
 	if err := os.WriteFile(filepath.Join(app.s.cfg.BackupDir, sid, fn), []byte("SNAP"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := d.CreateBackup(db.Backup{ID: "b1", ServiceID: sid, Kind: "minio", Filename: fn, Size: 4, CreatedAt: "2026-08-31T12:00:00Z"}); err != nil {
+	if err := d.CreateBackup(db.Backup{ID: "b1", ServiceID: sid, Kind: "garage", Filename: fn, Size: 4, CreatedAt: "2026-08-31T12:00:00Z"}); err != nil {
 		t.Fatal(err)
 	}
 	req := httptest.NewRequest("POST", "/service/"+sid+"/backup/b1/restore", nil)
@@ -521,20 +521,20 @@ func TestRestoreBackupMinioRecreatesBuckets(t *testing.T) {
 	}
 	joined := strings.Join(app.s.cfg.DockerRaw.(*fakeSnapshotRunner).ran, " ")
 	if !strings.Contains(joined, "mc mb") {
-		t.Fatalf("minio restore should recreate buckets with mc mb, got %v", joined)
+		t.Fatalf("garage restore should recreate buckets with mc mb, got %v", joined)
 	}
 	if !strings.Contains(joined, "mc mirror") || !strings.Contains(joined, "mitia/photos") {
-		t.Fatalf("minio restore should mirror each bucket back, got %v", joined)
+		t.Fatalf("garage restore should mirror each bucket back, got %v", joined)
 	}
-	if !strings.Contains(joined, "/minio/photos:/src") {
-		t.Fatalf("minio restore should mirror from the extracted bucket dump, got %v", joined)
+	if !strings.Contains(joined, "/s3/photos:/src") {
+		t.Fatalf("garage restore should mirror from the extracted bucket dump, got %v", joined)
 	}
-	if !strings.Contains(joined, "tar -xzf /in/snap.tgz -C /out minio ") {
-		t.Fatalf("minio restore should extract the bucket dumps, got %v", joined)
+	if !strings.Contains(joined, "tar -xzf /in/snap.tgz -C /out s3 ") {
+		t.Fatalf("garage restore should extract the bucket dumps, got %v", joined)
 	}
 	composeCalls := strings.Join(app.s.cfg.Docker.(*fakeRunner).recorded(), " ")
 	if !strings.Contains(composeCalls, "down") || !strings.Contains(composeCalls, "up -d") {
-		t.Fatalf("minio restore should stop then start the service, got %q", composeCalls)
+		t.Fatalf("garage restore should stop then start the service, got %q", composeCalls)
 	}
 }
 
@@ -562,7 +562,7 @@ func newSchedulerApp(t *testing.T, global string) (*db.DB, *App) {
 func TestBackupSchedulerRunsDueService(t *testing.T) {
 	d, app := newSchedulerApp(t, "daily")
 	// a service with an explicit due (never-backed-up) schedule
-	sid, _ := d.CreateService("minio", "m")
+	sid, _ := d.CreateService("garage", "m")
 	svcDir := filepath.Join(app.s.cfg.DeployDir, sid)
 	if err := os.MkdirAll(svcDir, 0o755); err != nil {
 		t.Fatal(err)
@@ -601,7 +601,7 @@ func TestBackupSchedulerRunsDueService(t *testing.T) {
 
 func TestBackupSchedulerSkipsGlobalOff(t *testing.T) {
 	d, app := newSchedulerApp(t, "off")
-	sid, _ := d.CreateService("minio", "m")
+	sid, _ := d.CreateService("garage", "m")
 	if err := os.MkdirAll(filepath.Join(app.s.cfg.DeployDir, sid), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -614,16 +614,16 @@ func TestBackupSchedulerSkipsGlobalOff(t *testing.T) {
 }
 
 func TestDeleteServiceRemovesBackupFiles(t *testing.T) {
-	d, h, sid := newServiceTestApp(t, "minio")
+	d, h, sid := newServiceTestApp(t, "garage")
 	app := h.(*App)
 	if err := os.MkdirAll(filepath.Join(app.s.cfg.BackupDir, sid), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	f := filepath.Join(app.s.cfg.BackupDir, sid, "20260831T120000-minio.tar.gz")
+	f := filepath.Join(app.s.cfg.BackupDir, sid, "20260831T120000-garage.tar.gz")
 	if err := os.WriteFile(f, []byte("SNAP"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := d.CreateBackup(db.Backup{ID: "b1", ServiceID: sid, Kind: "minio", Filename: "20260831T120000-minio.tar.gz", Size: 4, CreatedAt: "2026-08-31T12:00:00Z"}); err != nil {
+	if err := d.CreateBackup(db.Backup{ID: "b1", ServiceID: sid, Kind: "garage", Filename: "20260831T120000-garage.tar.gz", Size: 4, CreatedAt: "2026-08-31T12:00:00Z"}); err != nil {
 		t.Fatal(err)
 	}
 	req := httptest.NewRequest("POST", "/service/"+sid+"/delete", nil)

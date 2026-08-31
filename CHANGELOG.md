@@ -1,5 +1,13 @@
 # Changelog
 
+
+## [Unreleased]
+
+### BREAKING CHANGES
+
+* **services:** replace MinIO with **Garage** (`dxflrs/garage`, S3-compatible object storage). Existing `minio` services migrate to the `garage` kind and their config keys are renamed to `GARAGE_*`; legacy MinIO data is **not** imported (different on-disk format) so migrated services must re-seed. The S3 endpoint is port `3900` (was `9000`) and there is no longer a web console. On first launch the app auto-generates an S3 access key + secret (stored encrypted) instead of asking for `MINIO_ROOT_USER`/`MINIO_ROOT_PASSWORD`.
+
+
 ## [1.2.2](https://github.com/jullury/mitia-ops/compare/v1.2.1...v1.2.2) (2026-08-31)
 
 

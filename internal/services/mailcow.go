@@ -64,7 +64,7 @@ func init() {
 // the checkout whose mailcow.conf is regenerated, so the credentials stay in
 // sync with the service's named Docker volumes. They are not user fields (the
 // form only ever emits MAILCOW_* keys) and live in config_items alongside the
-// app-managed values (e.g. MINIO_VOLUME_NAME).
+// app-managed values (e.g. GARAGE_VOLUME_NAME).
 const (
 	MailcowSecretDBPass    = "mailcow.dbpass"
 	MailcowSecretDBRoot    = "mailcow.dbroot"

@@ -69,16 +69,53 @@
     </fieldset>
   </div>
 
-  {{ if and .IsMinio .BackupConfigured }} {{/* Minio per-bucket backup toggles */}}
+  {{ if .IsGarage }}
+  <div class="card">
+    <h2 class="card-title">Connection</h2>
+    <fieldset class="field-group">
+      {{ if .GarageSecretSet }}
+      <div class="row">
+        <label for="garage-endpoint">S3 endpoint</label>
+        <div class="cred-row">
+          <input type="text" id="garage-endpoint" class="cred-value" value="{{ .GarageEndpoint }}" readonly>
+          <button type="button" class="btn muted" onclick="copyVal('garage-endpoint', this)" title="Copy">Copy</button>
+        </div>
+        <p class="hint">Plain HTTP on port 3900 (the only exposed S3 port). The configured S3 hostname is used when set; otherwise this is the container-internal endpoint.</p>
+      </div>
+      <div class="row">
+        <label for="garage-access">Access key</label>
+        <div class="cred-row">
+          <input type="text" id="garage-access" class="cred-value" value="{{ .GarageAccessKey }}" readonly>
+          <button type="button" class="btn muted" onclick="copyVal('garage-access', this)" title="Copy">Copy</button>
+        </div>
+      </div>
+      <div class="row">
+        <label for="garage-secret">Secret key</label>
+        <div class="cred-row">
+          <input type="password" id="garage-secret" class="cred-value" value="{{ .GarageSecret }}" readonly>
+          <button type="button" class="btn muted" id="garage-secret-toggle" onclick="toggleSecret('garage-secret', this)" title="Show/hide">Show</button>
+          <button type="button" class="btn muted" onclick="copyVal('garage-secret', this)" title="Copy">Copy</button>
+        </div>
+        <p class="hint">Auto-generated on first start and unique to this service. It grants full access to every bucket &mdash; keep it private.</p>
+      </div>
+      <p class="hint">Client example: <span class="mono">mc alias set mitia {{ .GarageEndpoint }} &lt;access-key&gt; &lt;secret-key&gt;</span></p>
+      {{ else }}
+      <p class="hint">S3 credentials are generated when the service is first started. Start the service, then reload this page.</p>
+      {{ end }}
+    </fieldset>
+  </div>
+  {{ end }}
+
+  {{ if and .IsGarage .BackupConfigured }} {{/* Garage per-bucket backup toggles */}}
   <div class="card">
     <h2 class="card-title">Backup buckets</h2>
     <fieldset class="field-group">
       <p class="hint">Choose which buckets to back up. Each selected bucket is dumped individually and restored bucket-by-bucket; unselected buckets are not captured.</p>
-      {{ if .MinioBucketsErr }}<p class="hint" style="color:var(--danger,#b91c1c)">{{ .MinioBucketsErr }} Your saved selection is kept; the physical volume snapshot is still taken as a fallback.</p>{{ end }}
-      {{ range $i, $b := .MinioBuckets }}
+      {{ if .GarageBucketsErr }}<p class="hint" style="color:var(--danger,#b91c1c)">{{ .GarageBucketsErr }} Your saved selection is kept; the physical volume snapshot is still taken as a fallback.</p>{{ end }}
+      {{ range $i, $b := .GarageBuckets }}
       <div class="check-row">
-        <input type="checkbox" id="minio_bucket_{{ $i }}" name="minio_bucket_{{ $i }}" value="{{ $b }}" {{ if index $.EnabledBuckets $b }}checked{{ end }}>
-        <label for="minio_bucket_{{ $i }}">{{ $b }}</label>
+        <input type="checkbox" id="garage_bucket_{{ $i }}" name="garage_bucket_{{ $i }}" value="{{ $b }}" {{ if index $.EnabledBuckets $b }}checked{{ end }}>
+        <label for="garage_bucket_{{ $i }}">{{ $b }}</label>
       </div>
       {{ else }}
       <p class="hint">No buckets detected yet. Start the service, create buckets, then reload this page.</p>
@@ -288,6 +325,25 @@
       });
     });
   });
+
+  window.copyVal = function (id, btn) {
+    var el = document.getElementById(id);
+    var prev = btn.textContent;
+    navigator.clipboard.writeText(el.value).then(function () {
+      btn.textContent = 'Copied';
+      setTimeout(function () { btn.textContent = prev; }, 1200);
+    })['catch'](function () {});
+  };
+  window.toggleSecret = function (id, btn) {
+    var el = document.getElementById(id);
+    if (el.type === 'password') {
+      el.type = 'text';
+      btn.textContent = 'Hide';
+    } else {
+      el.type = 'password';
+      btn.textContent = 'Show';
+    }
+  };
 })();
 </script>
 {{ end }}

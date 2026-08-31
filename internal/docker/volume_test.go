@@ -54,14 +54,14 @@ func sub(s, substr string) bool {
 }
 
 func TestVolumeName(t *testing.T) {
-	if got := VolumeName("/srv/deployments/12", "minio_data"); got != "12_minio_data" {
-		t.Fatalf("VolumeName = %q, want 12_minio_data", got)
+	if got := VolumeName("/srv/deployments/12", "garage_data"); got != "12_garage_data" {
+		t.Fatalf("VolumeName = %q, want 12_garage_data", got)
 	}
 }
 
 func TestEnsureVolumeDoesNotRecreate(t *testing.T) {
 	r := &recordingRunner{exist: true}
-	if err := EnsureVolume(r, "12_minio_data"); err != nil {
+	if err := EnsureVolume(r, "12_garage_data"); err != nil {
 		t.Fatal(err)
 	}
 	if len(r.rawSeq) != 1 {
@@ -74,7 +74,7 @@ func TestEnsureVolumeDoesNotRecreate(t *testing.T) {
 
 func TestEnsureVolumeCreatesWhenMissing(t *testing.T) {
 	r := &recordingRunner{exist: false}
-	if err := EnsureVolume(r, "12_minio_data"); err != nil {
+	if err := EnsureVolume(r, "12_garage_data"); err != nil {
 		t.Fatal(err)
 	}
 	if len(r.rawSeq) != 2 {
@@ -90,11 +90,11 @@ func TestEnsureVolumeCreatesWhenMissing(t *testing.T) {
 
 func TestCreateVolumePlain(t *testing.T) {
 	r := &recordingRunner{}
-	if err := CreateVolume(r, "12_minio_data"); err != nil {
+	if err := CreateVolume(r, "12_garage_data"); err != nil {
 		t.Fatal(err)
 	}
 	last := r.rawSeq[len(r.rawSeq)-1]
-	if !anyContains(last, "12_minio_data") {
+	if !anyContains(last, "12_garage_data") {
 		t.Fatalf("create should carry the volume name, got %v", last)
 	}
 	if anyContains(last, "size=") || anyContains(last, "type=") || anyContains(last, "device=") || anyContains(last, "o=") {
@@ -132,13 +132,13 @@ func isVolumeCmd(args []string, verb, name string) bool {
 }
 
 func TestRelocateVolumeFullMove(t *testing.T) {
-	r := &recordingRunner{real: map[string]bool{"4_minio_data": true}}
-	if err := RelocateVolume(r, "4_minio_data", "abcd-1234_minio_data"); err != nil {
+	r := &recordingRunner{real: map[string]bool{"4_garage_data": true}}
+	if err := RelocateVolume(r, "4_garage_data", "abcd-1234_garage_data"); err != nil {
 		t.Fatal(err)
 	}
 	// The source is removed last, proving the copy completed first.
 	last := r.rawSeq[len(r.rawSeq)-1]
-	if !isVolumeCmd(last, "rm", "4_minio_data") {
+	if !isVolumeCmd(last, "rm", "4_garage_data") {
 		t.Fatalf("expected final source removal, got %v", last)
 	}
 	// The data must be archived and restored, never just renamed.
@@ -157,10 +157,10 @@ func TestRelocateVolumeFullMove(t *testing.T) {
 	// Target created exactly once (it did not exist, so must not be dropped).
 	creates := 0
 	for _, args := range r.rawSeq {
-		if isVolumeCmd(args, "create", "abcd-1234_minio_data") {
+		if isVolumeCmd(args, "create", "abcd-1234_garage_data") {
 			creates++
 		}
-		if isVolumeCmd(args, "rm", "abcd-1234_minio_data") {
+		if isVolumeCmd(args, "rm", "abcd-1234_garage_data") {
 			creates = 99 // flag unexpected target removal
 		}
 	}
@@ -170,15 +170,15 @@ func TestRelocateVolumeFullMove(t *testing.T) {
 }
 
 func TestRelocateVolumeDropsStaleTarget(t *testing.T) {
-	r := &recordingRunner{real: map[string]bool{"4_minio_data": true, "abcd-1234_minio_data": true}}
-	if err := RelocateVolume(r, "4_minio_data", "abcd-1234_minio_data"); err != nil {
+	r := &recordingRunner{real: map[string]bool{"4_garage_data": true, "abcd-1234_garage_data": true}}
+	if err := RelocateVolume(r, "4_garage_data", "abcd-1234_garage_data"); err != nil {
 		t.Fatal(err)
 	}
 	// A stale target (empty volume created by an interrupted run) must be
 	// dropped before the recreate, since the source holds the real data.
 	dropped := false
 	for _, args := range r.rawSeq {
-		if isVolumeCmd(args, "rm", "abcd-1234_minio_data") {
+		if isVolumeCmd(args, "rm", "abcd-1234_garage_data") {
 			dropped = true
 		}
 	}
@@ -189,11 +189,11 @@ func TestRelocateVolumeDropsStaleTarget(t *testing.T) {
 
 func TestRelocateVolumeNoopWhenSourceGone(t *testing.T) {
 	r := &recordingRunner{real: map[string]bool{}}
-	if err := RelocateVolume(r, "4_minio_data", "abcd-1234_minio_data"); err != nil {
+	if err := RelocateVolume(r, "4_garage_data", "abcd-1234_garage_data"); err != nil {
 		t.Fatal(err)
 	}
 	// Source already moved: only the existence check runs, nothing is created.
-	if len(r.rawSeq) != 1 || !isVolumeCmd(r.rawSeq[0], "inspect", "4_minio_data") {
+	if len(r.rawSeq) != 1 || !isVolumeCmd(r.rawSeq[0], "inspect", "4_garage_data") {
 		t.Fatalf("expected a single inspection, got %v", r.rawSeq)
 	}
 }
@@ -225,20 +225,20 @@ func TestBackupSnapshotArgv(t *testing.T) {
 	}
 }
 
-func TestBackupSnapshotIncludesMinioStage(t *testing.T) {
+func TestBackupSnapshotIncludesS3Stage(t *testing.T) {
 	r := &recordingRunner{}
-	vols := []string{"12_minio_data"}
-	err := BackupSnapshot(r, vols, "/deploy/12", "", "/minstage", "/out/12-minio.tar.gz", VolumeImage)
+	vols := []string{"12_garage_data"}
+	err := BackupSnapshot(r, vols, "/deploy/12", "", "/s3stage", "/out/12-garage.tar.gz", VolumeImage)
 	if err != nil {
 		t.Fatal(err)
 	}
 	last := r.rawSeq[len(r.rawSeq)-1]
 	joined := strings.Join(last, " ")
-	if !strings.Contains(joined, "/minstage:/snap/minio:ro") {
-		t.Fatalf("BackupSnapshot missing minio stage mount: %v", last)
+	if !strings.Contains(joined, "/s3stage:/snap/s3:ro") {
+		t.Fatalf("BackupSnapshot missing s3 stage mount: %v", last)
 	}
-	if !strings.Contains(joined, "volumes deploy minio") {
-		t.Fatalf("BackupSnapshot must tar volumes+deploy+minio: %v", last)
+	if !strings.Contains(joined, "volumes deploy s3") {
+		t.Fatalf("BackupSnapshot must tar volumes+deploy+s3: %v", last)
 	}
 }
 

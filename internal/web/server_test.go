@@ -68,7 +68,7 @@ func testServer(t *testing.T) (*db.DB, http.Handler) {
 
 func TestDashboard(t *testing.T) {
 	d, h := testServer(t)
-	id, err := d.CreateService("minio", "main")
+	id, err := d.CreateService("garage", "main")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,7 +79,7 @@ func TestDashboard(t *testing.T) {
 		t.Fatalf("status %d", rec.Code)
 	}
 	body := rec.Body.String()
-	// assert a service-row-specific marker, not just "minio" (always present
+	// assert a service-row-specific marker, not just "garage" (always present
 	// as a dropdown option)
 	if !strings.Contains(body, `href="/service/`+id+`"`) {
 		t.Fatalf("dashboard should link to the service row: %s", body)
@@ -103,7 +103,7 @@ func TestStatusClass(t *testing.T) {
 		{`{"foo":"bar"}`, "unknown", "Unknown"},
 		// stderr warnings prepended to the JSON (the real bug): status must
 		// still resolve from the embedded "State" field.
-		{`time="2026-08-28T22:24:34+03:00" level=warning msg="The \"MINIO_ROOT_USER\" variable is not set. Defaulting to a blank string."` + "\n" + `{"State":"running","Status":"Up 4 minutes"}`, "running", "Running"},
+		{`time="2026-08-28T22:24:34+03:00" level=warning msg="The \"GARAGE_ACCESS_KEY_ID\" variable is not set. Defaulting to a blank string."` + "\n" + `{"State":"running","Status":"Up 4 minutes"}`, "running", "Running"},
 		{`warning line 1` + "\n" + `{"State":"exited","Status":"Exited (1)"}`, "stopped", "Stopped"},
 	}
 	for _, c := range cases {
@@ -118,7 +118,7 @@ func TestStatusClass(t *testing.T) {
 
 func TestActionFlash(t *testing.T) {
 	d, h := testServer(t)
-	id, err := d.CreateService("minio", "main")
+	id, err := d.CreateService("garage", "main")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -142,7 +142,7 @@ func TestActionFlash(t *testing.T) {
 
 func TestUnknownActionOpRejected(t *testing.T) {
 	d, h := testServer(t)
-	id, err := d.CreateService("minio", "main")
+	id, err := d.CreateService("garage", "main")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -156,8 +156,8 @@ func TestUnknownActionOpRejected(t *testing.T) {
 
 func TestSaveAndShowService(t *testing.T) {
 	d, h := testServer(t)
-	id, _ := d.CreateService("minio", "main")
-	form := "MINIO_ROOT_USER=admin&MINIO_ROOT_PASSWORD=supersecret&MINIO_HOSTNAME=s3.example.com"
+	id, _ := d.CreateService("garage", "main")
+	form := "GARAGE_ACCESS_KEY_ID=admin&GARAGE_SECRET_ACCESS_KEY=supersecret&GARAGE_HOSTNAME=s3.example.com"
 	req := httptest.NewRequest("POST", "/service/"+id, strings.NewReader(form))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	rec := httptest.NewRecorder()
@@ -167,7 +167,7 @@ func TestSaveAndShowService(t *testing.T) {
 	}
 	// stored value must be encrypted
 	items, _ := d.ConfigItems(id)
-	if items["MINIO_ROOT_PASSWORD"] == "supersecret" {
+	if items["GARAGE_SECRET_ACCESS_KEY"] == "supersecret" {
 		t.Fatal("password should be stored encrypted")
 	}
 }
@@ -192,8 +192,8 @@ func TestUpActionRemovesEphemeralEnv(t *testing.T) {
 		}
 	}
 
-	id, _ := d.CreateService("minio", "main")
-	save(id, "MINIO_ROOT_PASSWORD=supersecret&MINIO_HOSTNAME=s3.example.com&MINIO_ROOT_USER=admin")
+	id, _ := d.CreateService("garage", "main")
+	save(id, "GARAGE_SECRET_ACCESS_KEY=supersecret&GARAGE_HOSTNAME=s3.example.com&GARAGE_ACCESS_KEY_ID=admin")
 
 	envPath := filepath.Join(deployDir, id, ".env")
 	if _, err := os.Stat(envPath); !os.IsNotExist(err) {
@@ -688,6 +688,234 @@ func TestMailcowStatusError(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("async up missing hostname should report error state; last: %s", last)
+}
+
+func TestJobTrackerExpiresTerminalJobs(t *testing.T) {
+	base := time.Date(2026, 8, 31, 12, 0, 0, 0, time.UTC)
+	tr := newJobTracker()
+	tr.now = func() time.Time { return base }
+
+	tr.set("m", JobCloning, "cloning", "")
+	if _, ok := tr.get("m"); !ok {
+		t.Fatal("in-flight job should be visible")
+	}
+	// Non-terminal (in-flight) jobs are never pruned, however old they get.
+	tr.now = func() time.Time { return base.Add(jobRetention + time.Hour) }
+	if _, ok := tr.get("m"); !ok {
+		t.Fatal("in-flight job must not expire")
+	}
+
+	// Terminal jobs are retained briefly (so the UI can read the final state),
+	// then pruned. A lingering terminal job makes the dashboard treat a finished
+	// deployment as a fresh "running" result and reload the page in a loop.
+	tr.now = func() time.Time { return base }
+	tr.set("m", JobRunning, "done", "")
+	if j, ok := tr.get("m"); !ok || j.state != JobRunning {
+		t.Fatalf("fresh terminal job should be visible, got ok=%v", ok)
+	}
+	tr.now = func() time.Time { return base.Add(jobRetention + time.Second) }
+	if _, ok := tr.get("m"); ok {
+		t.Fatal("expired terminal job must be pruned")
+	}
+
+	// Error state likewise expires.
+	tr.now = func() time.Time { return base }
+	tr.set("e", JobError, "boom", "err")
+	if _, ok := tr.get("e"); !ok {
+		t.Fatal("fresh error job should be visible")
+	}
+	tr.now = func() time.Time { return base.Add(jobRetention + time.Second) }
+	if _, ok := tr.get("e"); ok {
+		t.Fatal("expired error job must be pruned")
+	}
+}
+
+func TestGarageTomlRequiredFields(t *testing.T) {
+	rpcSecret := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" // 32-byte hex
+	toml := garageToml("s3.example.com", "us-east-1", rpcSecret)
+	for _, want := range []string{
+		`metadata_dir = "/srv/garage/meta"`,
+		`data_dir = "/srv/garage/data"`,
+		`replication_factor = 1`,
+		`rpc_bind_addr = "[::]:3901"`,
+		`rpc_secret = "` + rpcSecret + `"`,
+		`[s3_api]`,
+		`s3_region = "us-east-1"`,
+		`api_bind_addr = "[::]:3900"`,
+		`[s3_web]`,
+		`index = "index.html"`,
+	} {
+		if !strings.Contains(toml, want) {
+			t.Fatalf("garage.toml missing %q:\n%s", want, toml)
+		}
+	}
+	// root_domain is required in BOTH [s3_api] and [s3_web], and the configured
+	// GARAGE_HOSTNAME must be used (this is what the user's "S3 hostname" is for).
+	if strings.Count(toml, `root_domain = "s3.example.com"`) != 2 {
+		t.Fatalf("both s3_api and s3_web must set root_domain from the hostname:\n%s", toml)
+	}
+	if !strings.Contains(garageToml("", "", "x"), `root_domain = "s3.mitia.local"`) {
+		t.Fatal("missing placeholder root_domain when no hostname configured")
+	}
+	// s3_region is cosmetic only; leave it alone when a value is provided, and
+	// fall back to eu-west-1 when empty.
+	if !strings.Contains(garageToml("", "", "x"), `s3_region = "eu-west-1"`) {
+		t.Fatal("missing default s3_region when none configured")
+	}
+}
+
+func TestRandomHex(t *testing.T) {
+	s := randomHex(32)
+	if len(s) != 64 {
+		t.Fatalf("randomHex(32) = %d chars, want 64 (32-byte hex)", len(s))
+	}
+	if randomHex(32) == s {
+		t.Fatal("randomHex should not repeat")
+	}
+}
+
+func TestGarageServiceShowsConnection(t *testing.T) {
+	dbDir := filepath.Join(t.TempDir(), "test.db")
+	d, err := db.Open(dbDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { d.Close() })
+	c, _ := crypto.New("master")
+	h := New(Config{DB: d, Cipher: c, DeployDir: t.TempDir(), Docker: &fakeRunner{}})
+
+	id, err := d.CreateService("garage", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	enc, err := c.Encrypt("verysecret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.SetConfigItems(id, []db.ConfigItem{
+		{Key: "GARAGE_HOSTNAME", Value: "s3.example.com"},
+		{Key: "GARAGE_ACCESS_KEY_ID", Value: "access123"},
+		{Key: "GARAGE_SECRET_ACCESS_KEY", Value: enc},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/service/"+id, nil))
+	body := rec.Body.String()
+	for _, want := range []string{
+		"Connection", "s3.example.com:3900", "access123",
+		"verysecret", `id="garage-secret"`, `id="garage-endpoint"`, `id="garage-access"`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("service page missing %q", want)
+		}
+	}
+}
+
+// scriptedRaw is a RawRunner that returns canned output for a given docker
+// invocation and records every call it made.
+type scriptedRaw struct {
+	responses map[string]string
+	calls     []string
+}
+
+func (f *scriptedRaw) RunRaw(args ...string) (string, error) {
+	f.calls = append(f.calls, strings.Join(args, " "))
+	if out, ok := f.responses[strings.Join(args, " ")]; ok {
+		return out, nil
+	}
+	return "ok", nil
+}
+
+func TestPostUpGarageInitializesCluster(t *testing.T) {
+	dbDir := filepath.Join(t.TempDir(), "test.db")
+	d, err := db.Open(dbDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { d.Close() })
+	c, _ := crypto.New("master")
+	id, err := d.CreateService("garage", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodeID := "e29344419cf19f4f9b04b5d5e39d5bb4d165fe125bb74ea791b4771262850806"
+	raw := &scriptedRaw{responses: map[string]string{
+		"exec " + id + "-garage-1 /garage layout show": "No nodes currently have a role in the cluster.\n\nCurrent cluster layout version: 0\n",
+		"exec " + id + "-garage-1 /garage node id":     nodeID + "\n",
+	}}
+	s := &server{
+		cfg: Config{
+			DB:        d,
+			Cipher:    c,
+			DockerRaw: raw,
+		},
+	}
+	enc, _ := c.Encrypt("s3cret")
+	if err := d.SetConfigItems(id, []db.ConfigItem{
+		{Key: garageAccessKeyKey, Value: "mitia-access1"},
+		{Key: garageSecretKeyKey, Value: enc},
+		{Key: bucketBackupKey, Value: "alpha,beta"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.postUpGarage(id); err != nil {
+		t.Fatalf("postUpGarage: %v", err)
+	}
+	joined := strings.Join(raw.calls, "\n")
+	for _, want := range []string{
+		"layout assign -z dc1 -c 1TB " + nodeID,
+		"layout apply --version 1",
+		"key import -n mitia-ops-" + id + " --yes mitia-access1 s3cret",
+		"key allow mitia-access1 --create-bucket",
+		"bucket allow alpha --key mitia-access1 --read --write",
+		"bucket allow beta --key mitia-access1 --read --write",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("postUpGarage did not run %q\ncalls:\n%s", want, joined)
+		}
+	}
+}
+
+func TestPostUpGarageSkipsWhenLayoutReady(t *testing.T) {
+	dbDir := filepath.Join(t.TempDir(), "test.db")
+	d, err := db.Open(dbDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { d.Close() })
+	c, _ := crypto.New("master")
+	id, err := d.CreateService("garage", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := &scriptedRaw{responses: map[string]string{
+		"exec " + id + "-garage-1 /garage layout show": "==== CURRENT CLUSTER LAYOUT ====\nNodes: 1\n",
+	}}
+	s := &server{cfg: Config{DB: d, Cipher: c, DockerRaw: raw}}
+	enc, _ := c.Encrypt("s3cret")
+	if err := d.SetConfigItems(id, []db.ConfigItem{
+		{Key: garageAccessKeyKey, Value: "mitia-access1"},
+		{Key: garageSecretKeyKey, Value: enc},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.postUpGarage(id); err != nil {
+		t.Fatalf("postUpGarage: %v", err)
+	}
+	joined := strings.Join(raw.calls, "\n")
+	if strings.Contains(joined, "layout assign") {
+		t.Errorf("layout assign should be skipped once the layout is ready:\n%s", joined)
+	}
+	for _, want := range []string{
+		"key import -n mitia-ops-" + id + " --yes mitia-access1 s3cret",
+		"key allow mitia-access1 --create-bucket",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("postUpGarage did not run %q\ncalls:\n%s", want, joined)
+		}
+	}
 }
 
 func TestSaveMailcowDoesNotCreateCompose(t *testing.T) {
@@ -1317,12 +1545,12 @@ func TestSaveSizeChangeTriggersResize(t *testing.T) {
 	t.Cleanup(func() { d.Close() })
 	c, _ := crypto.New("master")
 	deployDir := t.TempDir()
-	id, _ := d.CreateService("minio", "main")
+	id, _ := d.CreateService("garage", "main")
 
 	// Seed initial config via a plain save (no raw runner, no volume yet) so a
 	// later size change can then be detected as a real change.
 	seed := httptest.NewRequest("POST", "/service/"+id,
-		strings.NewReader("MINIO_ROOT_USER=admin&MINIO_ROOT_PASSWORD=supersecret&MINIO_HOSTNAME=s3.example.com&MINIO_VOLUME_SIZE=1&MINIO_VOLUME_SIZE_UNIT=G"))
+		strings.NewReader("GARAGE_ACCESS_KEY_ID=admin&GARAGE_SECRET_ACCESS_KEY=supersecret&GARAGE_HOSTNAME=s3.example.com&GARAGE_VOLUME_SIZE=1&GARAGE_VOLUME_SIZE_UNIT=G"))
 	seed.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	seedRec := httptest.NewRecorder()
 	New(Config{DB: d, Cipher: c, DeployDir: deployDir, Docker: &fakeRunner{}}).ServeHTTP(seedRec, seed)
@@ -1334,7 +1562,7 @@ func TestSaveSizeChangeTriggersResize(t *testing.T) {
 	// Changing the size (1G -> 2G) on the main save form must drive the
 	// fail-safe resize (volume exists per the fake raw runner).
 	req := httptest.NewRequest("POST", "/service/"+id,
-		strings.NewReader("MINIO_ROOT_USER=admin&MINIO_ROOT_PASSWORD=supersecret&MINIO_HOSTNAME=s3.example.com&MINIO_VOLUME_SIZE=2&MINIO_VOLUME_SIZE_UNIT=G"))
+		strings.NewReader("GARAGE_ACCESS_KEY_ID=admin&GARAGE_SECRET_ACCESS_KEY=supersecret&GARAGE_HOSTNAME=s3.example.com&GARAGE_VOLUME_SIZE=2&GARAGE_VOLUME_SIZE_UNIT=G"))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	rec := httptest.NewRecorder()
 	New(Config{DB: d, Cipher: c, DeployDir: deployDir, Docker: &fakeRunner{}, DockerRaw: raw}).ServeHTTP(rec, req)
@@ -1343,18 +1571,18 @@ func TestSaveSizeChangeTriggersResize(t *testing.T) {
 	}
 
 	items, _ := d.ConfigItems(id)
-	if items["MINIO_VOLUME_SIZE"] != "2G" {
-		t.Fatalf("resized size stored = %q, want 2G", items["MINIO_VOLUME_SIZE"])
+	if items["GARAGE_VOLUME_SIZE"] != "2G" {
+		t.Fatalf("resized size stored = %q, want 2G", items["GARAGE_VOLUME_SIZE"])
 	}
-	if items["MINIO_VOLUME_NAME"] == "" {
+	if items["GARAGE_VOLUME_NAME"] == "" {
 		t.Fatal("resize must persist the new volume name")
 	}
 	composeBytes, err := os.ReadFile(filepath.Join(deployDir, id, "docker-compose.yml"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(composeBytes), "name: "+items["MINIO_VOLUME_NAME"]) {
-		t.Fatalf("compose should reference the new volume name %q: %s", items["MINIO_VOLUME_NAME"], composeBytes)
+	if !strings.Contains(string(composeBytes), "name: "+items["GARAGE_VOLUME_NAME"]) {
+		t.Fatalf("compose should reference the new volume name %q: %s", items["GARAGE_VOLUME_NAME"], composeBytes)
 	}
 	if len(raw.ran) == 0 {
 		t.Fatal("raw runner should have executed volume commands")
@@ -1369,17 +1597,17 @@ func TestSaveUnchangedSizeDoesNotResize(t *testing.T) {
 	t.Cleanup(func() { d.Close() })
 	c, _ := crypto.New("master")
 	deployDir := t.TempDir()
-	id, _ := d.CreateService("minio", "main")
+	id, _ := d.CreateService("garage", "main")
 
 	seed := httptest.NewRequest("POST", "/service/"+id,
-		strings.NewReader("MINIO_ROOT_USER=admin&MINIO_ROOT_PASSWORD=supersecret&MINIO_HOSTNAME=s3.example.com&MINIO_VOLUME_SIZE=1&MINIO_VOLUME_SIZE_UNIT=G"))
+		strings.NewReader("GARAGE_ACCESS_KEY_ID=admin&GARAGE_SECRET_ACCESS_KEY=supersecret&GARAGE_HOSTNAME=s3.example.com&GARAGE_VOLUME_SIZE=1&GARAGE_VOLUME_SIZE_UNIT=G"))
 	seed.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	New(Config{DB: d, Cipher: c, DeployDir: deployDir, Docker: &fakeRunner{}}).ServeHTTP(httptest.NewRecorder(), seed)
 
 	raw := &fakeRawRunner{}
 	// Same size again: should be a plain save, no volume commands.
 	req := httptest.NewRequest("POST", "/service/"+id,
-		strings.NewReader("MINIO_ROOT_USER=admin&MINIO_ROOT_PASSWORD=supersecret&MINIO_HOSTNAME=s3.example.com&MINIO_VOLUME_SIZE=1&MINIO_VOLUME_SIZE_UNIT=G"))
+		strings.NewReader("GARAGE_ACCESS_KEY_ID=admin&GARAGE_SECRET_ACCESS_KEY=supersecret&GARAGE_HOSTNAME=s3.example.com&GARAGE_VOLUME_SIZE=1&GARAGE_VOLUME_SIZE_UNIT=G"))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	rec := httptest.NewRecorder()
 	New(Config{DB: d, Cipher: c, DeployDir: deployDir, Docker: &fakeRunner{}, DockerRaw: raw}).ServeHTTP(rec, req)
@@ -1392,7 +1620,7 @@ func TestSaveUnchangedSizeDoesNotResize(t *testing.T) {
 }
 
 func TestFirstSavePersistsSizeWithoutResize(t *testing.T) {
-	// A brand-new minio service has no volume yet; saving a size is a plain
+	// A brand-new garage service has no volume yet; saving a size is a plain
 	// save (no raw runner needed). The volume is later created at that size by
 	// EnsureVolume on `up`.
 	d, err := db.Open(filepath.Join(t.TempDir(), "test.db"))
@@ -1401,10 +1629,10 @@ func TestFirstSavePersistsSizeWithoutResize(t *testing.T) {
 	}
 	t.Cleanup(func() { d.Close() })
 	c, _ := crypto.New("master")
-	id, _ := d.CreateService("minio", "main")
+	id, _ := d.CreateService("garage", "main")
 
 	req := httptest.NewRequest("POST", "/service/"+id,
-		strings.NewReader("MINIO_ROOT_USER=admin&MINIO_ROOT_PASSWORD=supersecret&MINIO_HOSTNAME=s3.example.com&MINIO_VOLUME_SIZE=1&MINIO_VOLUME_SIZE_UNIT=G"))
+		strings.NewReader("GARAGE_ACCESS_KEY_ID=admin&GARAGE_SECRET_ACCESS_KEY=supersecret&GARAGE_HOSTNAME=s3.example.com&GARAGE_VOLUME_SIZE=1&GARAGE_VOLUME_SIZE_UNIT=G"))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	rec := httptest.NewRecorder()
 	New(Config{DB: d, Cipher: c, DeployDir: t.TempDir(), Docker: &fakeRunner{}}).ServeHTTP(rec, req)
@@ -1412,8 +1640,8 @@ func TestFirstSavePersistsSizeWithoutResize(t *testing.T) {
 		t.Fatalf("first save status %d", rec.Code)
 	}
 	items, _ := d.ConfigItems(id)
-	if items["MINIO_VOLUME_SIZE"] != "1G" {
-		t.Fatalf("first save stored size = %q, want 1G", items["MINIO_VOLUME_SIZE"])
+	if items["GARAGE_VOLUME_SIZE"] != "1G" {
+		t.Fatalf("first save stored size = %q, want 1G", items["GARAGE_VOLUME_SIZE"])
 	}
 }
 
@@ -1424,10 +1652,10 @@ func TestShowServicePrefillsSizePicker(t *testing.T) {
 	}
 	t.Cleanup(func() { d.Close() })
 	c, _ := crypto.New("master")
-	id, _ := d.CreateService("minio", "main")
+	id, _ := d.CreateService("garage", "main")
 
 	save := httptest.NewRequest("POST", "/service/"+id,
-		strings.NewReader("MINIO_ROOT_USER=admin&MINIO_ROOT_PASSWORD=supersecret&MINIO_HOSTNAME=s3.example.com&MINIO_VOLUME_SIZE=1&MINIO_VOLUME_SIZE_UNIT=G"))
+		strings.NewReader("GARAGE_ACCESS_KEY_ID=admin&GARAGE_SECRET_ACCESS_KEY=supersecret&GARAGE_HOSTNAME=s3.example.com&GARAGE_VOLUME_SIZE=1&GARAGE_VOLUME_SIZE_UNIT=G"))
 	save.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	New(Config{DB: d, Cipher: c, DeployDir: t.TempDir(), Docker: &fakeRunner{}}).ServeHTTP(httptest.NewRecorder(), save)
 
@@ -1459,11 +1687,11 @@ func TestSaveRejectsOversizedVolume(t *testing.T) {
 	}
 	t.Cleanup(func() { d.Close() })
 	c, _ := crypto.New("master")
-	id, _ := d.CreateService("minio", "main")
+	id, _ := d.CreateService("garage", "main")
 
 	// 999999T (~1000 PiB) exceeds the free space of any real filesystem.
 	req := httptest.NewRequest("POST", "/service/"+id,
-		strings.NewReader("MINIO_ROOT_USER=admin&MINIO_ROOT_PASSWORD=supersecret&MINIO_HOSTNAME=s3.example.com&MINIO_VOLUME_SIZE=999999&MINIO_VOLUME_SIZE_UNIT=T"))
+		strings.NewReader("GARAGE_ACCESS_KEY_ID=admin&GARAGE_SECRET_ACCESS_KEY=supersecret&GARAGE_HOSTNAME=s3.example.com&GARAGE_VOLUME_SIZE=999999&GARAGE_VOLUME_SIZE_UNIT=T"))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	rec := httptest.NewRecorder()
 	New(Config{DB: d, Cipher: c, DeployDir: t.TempDir(), Docker: &fakeRunner{}}).ServeHTTP(rec, req)
@@ -1478,8 +1706,8 @@ func TestSaveRejectsOversizedVolume(t *testing.T) {
 		t.Fatalf("expected insufficient-storage message, got: %s", body)
 	}
 	items, _ := d.ConfigItems(id)
-	if items["MINIO_VOLUME_SIZE"] != "" {
-		t.Fatalf("rejected size must not be persisted, stored %q", items["MINIO_VOLUME_SIZE"])
+	if items["GARAGE_VOLUME_SIZE"] != "" {
+		t.Fatalf("rejected size must not be persisted, stored %q", items["GARAGE_VOLUME_SIZE"])
 	}
 }
 
@@ -1533,7 +1761,7 @@ func TestDeleteServiceTearsDownAndRemovesRows(t *testing.T) {
 	}
 }
 
-func TestDeleteMinioRemovesDataVolume(t *testing.T) {
+func TestDeleteGarageRemovesDataVolume(t *testing.T) {
 	d, err := db.Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -1544,9 +1772,9 @@ func TestDeleteMinioRemovesDataVolume(t *testing.T) {
 	raw := &fakeRawRunner{}
 	h := New(Config{DB: d, Cipher: c, DeployDir: deployDir, Docker: &fakeRunner{}, DockerRaw: raw})
 
-	id, _ := d.CreateService("minio", "main")
+	id, _ := d.CreateService("garage", "main")
 	// persist a custom volume name to assert we remove exactly that one
-	if err := d.SetConfigItems(id, []db.ConfigItem{{Key: "MINIO_VOLUME_NAME", Value: "custom_data"}}); err != nil {
+	if err := d.SetConfigItems(id, []db.ConfigItem{{Key: "GARAGE_VOLUME_NAME", Value: "custom_data"}}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1559,7 +1787,7 @@ func TestDeleteMinioRemovesDataVolume(t *testing.T) {
 	// assert the data volume was removed by the raw runner
 	joined := strings.Join(raw.ran, " ")
 	if !strings.Contains(joined, "volume rm") || !strings.Contains(joined, "custom_data") {
-		t.Fatalf("delete must remove the minio data volume, raw runner ran: %v", raw.ran)
+		t.Fatalf("delete must remove the garage data volume, raw runner ran: %v", raw.ran)
 	}
 	// DB row gone
 	if _, err := d.ServiceByID(id); err == nil {
@@ -1568,7 +1796,7 @@ func TestDeleteMinioRemovesDataVolume(t *testing.T) {
 }
 
 // TestSizePreflightAwareOfOtherServices guards the free-space preflight
-// counting EVERY service's declared volume size: minio + postgres (and future
+// counting EVERY service's declared volume size: garage + postgres (and future
 // sized kinds) collectively claim the same disk, so a preflight for one must
 // fail when another declares a size the disk can't hold — while still ignoring
 // the service's own past declaration.
@@ -1579,7 +1807,7 @@ func TestSizePreflightAwareOfOtherServices(t *testing.T) {
 	}
 	t.Cleanup(func() { d.Close() })
 	c, _ := crypto.New("master")
-	minioID, err := d.CreateService("minio", "data")
+	garageID, err := d.CreateService("garage", "data")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1593,19 +1821,19 @@ func TestSizePreflightAwareOfOtherServices(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	put(minioID, "MINIO_VOLUME_SIZE", "999999T")
+	put(garageID, "GARAGE_VOLUME_SIZE", "999999T")
 	put(pgID, "POSTGRES_VOLUME_SIZE", "999999T")
 	s := &server{cfg: Config{DB: d, Cipher: c, DeployDir: t.TempDir()}}
 
-	// A tiny new size for minio must still fail: postgres's declared volume
+	// A tiny new size for garage must still fail: postgres's declared volume
 	// size counts against the same disk.
-	if _, _, msg, ok := s.sizePreflight(t.TempDir(), minioID, "1M"); ok {
-		t.Fatalf("minio preflight must account for postgres's declared size, passed: %s", msg)
+	if _, _, msg, ok := s.sizePreflight(t.TempDir(), garageID, "1M"); ok {
+		t.Fatalf("garage preflight must account for postgres's declared size, passed: %s", msg)
 	}
-	// With postgres's declaration dropped, and minio excluded from its own
-	// check, a small minio volume fits.
+	// With postgres's declaration dropped, and garage excluded from its own
+	// check, a small garage volume fits.
 	put(pgID, "POSTGRES_VOLUME_SIZE", "")
-	if _, _, msg, ok := s.sizePreflight(t.TempDir(), minioID, "1M"); !ok {
+	if _, _, msg, ok := s.sizePreflight(t.TempDir(), garageID, "1M"); !ok {
 		t.Fatalf("without other declarations a small volume must pass: %s", msg)
 	}
 }
@@ -1679,7 +1907,7 @@ func TestDeleteMailcowRunsDownAndDeletes(t *testing.T) {
 
 func TestDashboardAndServicePageRenderDelete(t *testing.T) {
 	d, h := testServer(t)
-	id, err := d.CreateService("minio", "main")
+	id, err := d.CreateService("garage", "main")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1853,8 +2081,8 @@ func TestAutoStartStartsFlaggedServices(t *testing.T) {
 	}
 	seedMailcowDir(other)
 
-	// Flagged minio: must come up through the non-mailcow upService path.
-	min, err := d.CreateService("minio", "data2")
+	// Flagged garage: must come up through the non-mailcow upService path.
+	min, err := d.CreateService("garage", "data2")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1892,7 +2120,7 @@ func TestAutoStartStartsFlaggedServices(t *testing.T) {
 		}
 	}
 	if upCount != 2 {
-		t.Fatalf("AutoStart must up exactly the flagged services (mailcow + minio), got %v", got)
+		t.Fatalf("AutoStart must up exactly the flagged services (mailcow + garage), got %v", got)
 	}
 }
 
@@ -1999,7 +2227,7 @@ func TestVaultUnsealInitializesAndUnseals(t *testing.T) {
 
 func TestVaultUnsealRejectedForNonVaultKind(t *testing.T) {
 	d, h := testServer(t)
-	id, err := d.CreateService("minio", "minio")
+	id, err := d.CreateService("garage", "garage")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -4,7 +4,7 @@
 [![Go Version](https://img.shields.io/github/go-mod/go-version/jullury/mitia-ops)](go.mod)
 [![Go Reference](https://pkg.go.dev/badge/github.com/jullury/mitia-ops.svg)](https://pkg.go.dev/github.com/jullury/mitia-ops)
 
-mitia-ops manages your self-hosted services (MinIO, cloudflared, …) from a single
+mitia-ops manages your self-hosted services (Garage, cloudflared, …) from a single
 Go binary with a minimal web UI. Configuration is stored in SQLite with secrets
 encrypted at rest; the app generates the non-secret `docker-compose.yml`
 persistently and drives Docker (start / stop / restart).
@@ -158,16 +158,10 @@ versions:
 | Service    | Image pin                                                      |
 |------------|----------------------------------------------------------------|
 | cloudflared| `cloudflare/cloudflared:2026.8.2`                              |
-| minio      | `minio/minio:RELEASE.2025-09-07T16-13-09Z`                     |
+| garage     | `dxflrs/garage:v2.3.0`                                         |
 | vault      | `hashicorp/vault:2.0.4`                                        |
 | caddy      | `caddy:2.11.4`                                                 |
 | postgres   | `postgres:16-alpine`                                           |
-
-> **⚠️ MinIO is end-of-life.** The MinIO upstream project was archived in
-> **February 2026** and no longer ships releases or security patches; the
-> official Docker Hub image stopped updating. mitia-ops pins the last stable
-> image, but future MinIO CVEs have **no upstream fix**. Treat MinIO as a
-> known risk / legacy service and plan a migration.
 
 **Accessing the dashboard on a headless VPS.** By default the dashboard binds
 `MITIAOPS_ADDR` (default `:8080`) on **all** interfaces. On a public VPS you
@@ -190,20 +184,24 @@ dashboard behind cloudflared, which the app can drive for you (see below).
 
 ## Services
 
-- **minio** — S3 object storage (+ console). Its data volume (100G default) is
+- **garage** — S3 object storage (via the `dxflrs/garage` image). Deployed as a
+  single node configured by an app-generated `garage.toml`; the S3 API listens on
+  port `3900`. On first launch the app generates an S3 access key + secret,
+  stores the secret encrypted in SQLite, and presents it read-only in the
+  dashboard. There is no separate web console. Its data volume (100G default) is
   entered with a numeric input + unit picker (MiB/GiB/TiB). The size is a *soft*
   upper bound used by the free-space preflight at launch and resize: Docker's
   local volume driver cannot enforce a hard size on persistent storage (the
   `size` mount option only works for RAM-backed tmpfs), so the volume itself is a
   plain local volume. The preflight counts **every service's** declared volume
-  size, so minio, postgres and any future sized service can't collectively claim
+  size, so garage, postgres and any future sized service can't collectively claim
   more than the disk holds.
 - **postgres** — PostgreSQL (via the official `postgres:16-alpine` image). On
   first init it creates one default database (`POSTGRES_DB`, default
   `postgres`) owned by `POSTGRES_USER`; data lives in a persistent `pg_data`
   volume. Default host port is `5432`. Extra users and databases are created
   freely from inside the running server via `psql` — the app intentionally
-  manages just the single default database. Like minio it has a *Volume size
+  manages just the single default database. Like garage it has a *Volume size
   limit* picker, but it guards initiation only: a launch (start / restart /
   start-on-boot) is refused up front when the disk can't hold the configured
   size together with every other service's declared volume size.
@@ -287,7 +285,7 @@ internal/web         embedded web UI
 
 Every service page has a **Backups** card with a *Back up now* button. A manual
 (or scheduled) backup takes a live-online snapshot of the service with no
-downtime: it packages the service's named data volumes (e.g. `minio_data`,
+downtime: it packages the service's named data volumes (e.g. `garage_data`,
 `pg_data`), its deploy directory, and — for postgres — a `pg_dump` into a single
 download-able `tar.gz` stored under `MITIAOPS_BACKUPS` (default `<data>/backups`)
 as `<service-id>/<timestamp>-<id>.tar.gz`. Secrets stay encrypted in SQLite and

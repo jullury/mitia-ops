@@ -95,11 +95,16 @@
   // Live progress for long background deployments (e.g. the mailcow first
   // start). Each status cell that has a job id/state polls the JSON status
   // endpoint until the deployment settles, updating the badge in place.
+  //
+  // We only start polling when the page loaded with the job still in flight
+  // (cloning/pulling). If it loaded with a finished state (running/error) the
+  // deployment already settled before this page view — a re-render must NOT
+  // re-enter the poll/reload cycle, or the dashboard would reload forever.
   var cells = document.querySelectorAll('[data-job-state]');
   cells.forEach(function (cell) {
-    if (!cell.dataset.jobState) return;
+    var initial = cell.dataset.jobState;
+    if (initial !== 'cloning' && initial !== 'pulling') return;
     var id = cell.dataset.jobId;
-    var running = cell.dataset.jobState === 'running';
     var timer = setInterval(function () {
       fetch('/service/' + id + '/status')
         .then(function (res) {
@@ -123,7 +128,7 @@
           }
         })
         .catch(function () { clearInterval(timer); });
-    }, running ? 0 : 1000);
+    }, 1000);
   });
 })();
 </script>

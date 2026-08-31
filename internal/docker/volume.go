@@ -26,7 +26,7 @@ func VolumeExists(raw RawRunner, volumeName string) (bool, error) {
 // CreateVolume creates a plain local-driver volume. Docker's local driver
 // cannot enforce a size on persistent storage (the size mount option is only
 // valid for tmpfs), so a size is deliberately not passed here: the configured
-// MINIO_VOLUME_SIZE is advisory and is only used for the free-space preflight.
+// GARAGE_VOLUME_SIZE is advisory and is only used for the free-space preflight.
 func CreateVolume(raw RawRunner, volumeName string) error {
 	args := []string{"volume", "create", "--driver", "local", volumeName}
 	if _, err := raw.RunRaw(args...); err != nil {
@@ -128,11 +128,11 @@ func RemoveVolume(raw RawRunner, volumeName string) error {
 
 // BackupSnapshot archives a service's named Docker volumes (mounted readonly
 // under /snap/volumes/<basename>), its deploy dir (under /snap/deploy), and
-// optional staging dirs (pgdump under /snap/pgdump, minio buckets under
-// /snap/minio) into a single gzipped tar in outFile, via a disposable
+// optional staging dirs (pgdump under /snap/pgdump, s3 buckets under
+// /snap/s3) into a single gzipped tar in outFile, via a disposable
 // container. Volume basenames come from filepath.Base of each volume name.
 // RestoreSnapshot unpacks the same layout back out.
-func BackupSnapshot(raw RawRunner, volumes []string, deployDir, pgdumpDir, minioDir, outFile, image string) error {
+func BackupSnapshot(raw RawRunner, volumes []string, deployDir, pgdumpDir, s3Dir, outFile, image string) error {
 	args := []string{"run", "--rm"}
 	for _, v := range volumes {
 		args = append(args, "-v", v+":/snap/volumes/"+filepath.Base(v)+":ro")
@@ -141,16 +141,16 @@ func BackupSnapshot(raw RawRunner, volumes []string, deployDir, pgdumpDir, minio
 	if pgdumpDir != "" {
 		args = append(args, "-v", pgdumpDir+":/snap/pgdump:ro")
 	}
-	if minioDir != "" {
-		args = append(args, "-v", minioDir+":/snap/minio:ro")
+	if s3Dir != "" {
+		args = append(args, "-v", s3Dir+":/snap/s3:ro")
 	}
 	args = append(args, "-v", filepath.Dir(outFile)+":/out", image)
 	names := "volumes deploy"
 	if pgdumpDir != "" {
 		names += " pgdump"
 	}
-	if minioDir != "" {
-		names += " minio"
+	if s3Dir != "" {
+		names += " s3"
 	}
 	args = append(args, "sh", "-c", "tar -czf /out/snap.tgz -C /snap "+names)
 	if _, err := raw.RunRaw(args...); err != nil {

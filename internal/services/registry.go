@@ -6,7 +6,7 @@ import (
 )
 
 const (
-	KindMinio       Kind = "minio"
+	KindGarage      Kind = "garage"
 	KindMailcow     Kind = "mailcow"
 	KindCaddy       Kind = "caddy"
 	KindCloudflared Kind = "cloudflared"

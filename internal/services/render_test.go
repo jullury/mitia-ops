@@ -52,55 +52,51 @@ func TestPostgresRenderDefaults(t *testing.T) {
 	}
 }
 
-func TestMinioRender(t *testing.T) {
-	def, _ := Get(KindMinio)
+func TestGarageRender(t *testing.T) {
+	def, _ := Get(KindGarage)
 	res, err := def.Render(map[string]string{
-		"MINIO_HOSTNAME":      "s3.example.com",
-		"MINIO_CONSOLE_URL":   "https://console.example.com",
-		"MINIO_ROOT_USER":     "admin",
-		"MINIO_ROOT_PASSWORD": "superSecret",
-		"MINIO_VOLUME_SIZE":   "100G",
+		"GARAGE_HOSTNAME":    "s3.example.com",
+		"GARAGE_VOLUME_SIZE": "100G",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(res.DotEnv, "MINIO_ROOT_USER=admin") {
+	if !strings.Contains(res.DotEnv, "GARAGE_HOSTNAME=s3.example.com") {
 		t.Fatalf("missing env: %q", res.DotEnv)
 	}
-	if !strings.Contains(res.DotEnv, "MINIO_VOLUME_SIZE=100G") {
+	if !strings.Contains(res.DotEnv, "GARAGE_VOLUME_SIZE=100G") {
 		t.Fatalf("missing volume size env: %q", res.DotEnv)
 	}
-	if !strings.Contains(res.ComposeYAML, "minio/minio") {
-		t.Fatalf("expected minio image in compose: %q", res.ComposeYAML)
+	if !strings.Contains(res.ComposeYAML, "dxflrs/garage:v2.3.0") {
+		t.Fatalf("expected garage image in compose: %q", res.ComposeYAML)
+	}
+	if !strings.Contains(res.ComposeYAML, `- "3900:3900"`) {
+		t.Fatalf("expected s3 api port mapping: %q", res.ComposeYAML)
+	}
+	if !strings.Contains(res.ComposeYAML, "garage_data:/srv/garage") {
+		t.Fatalf("expected data volume mount: %q", res.ComposeYAML)
+	}
+	if !strings.Contains(res.ComposeYAML, "./garage.toml:/etc/garage.toml:ro") {
+		t.Fatalf("expected garage.toml config mount: %q", res.ComposeYAML)
 	}
 	if !strings.Contains(res.ComposeYAML, "external: true") {
-		t.Fatalf("expected minio data volume to be external: %q", res.ComposeYAML)
+		t.Fatalf("expected garage data volume to be external: %q", res.ComposeYAML)
 	}
-	if !strings.Contains(res.ComposeYAML, "name: "+"minio_data") {
+	if !strings.Contains(res.ComposeYAML, "name: "+"garage_data") {
 		t.Fatalf("expected external volume name in compose: %q", res.ComposeYAML)
-	}
-	if !strings.Contains(res.ComposeYAML, "MINIO_SERVER_URL: https://s3.example.com") {
-		t.Fatalf("expected minio server url advertised from hostname: %q", res.ComposeYAML)
-	}
-	if !strings.Contains(res.ComposeYAML, "MINIO_BROWSER_REDIRECT_URL: https://console.example.com") {
-		t.Fatalf("expected minio console url redirected from console url: %q", res.ComposeYAML)
 	}
 }
 
-func TestMinioRenderNoHostname(t *testing.T) {
-	def, _ := Get(KindMinio)
+func TestGarageRenderUsesTrackedVolumeName(t *testing.T) {
+	def, _ := Get(KindGarage)
 	res, err := def.Render(map[string]string{
-		"MINIO_ROOT_USER":     "admin",
-		"MINIO_ROOT_PASSWORD": "superSecret",
+		"GARAGE_VOLUME_NAME": "1234_garage_data",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(res.ComposeYAML, "MINIO_SERVER_URL") {
-		t.Fatalf("no MINIO_SERVER_URL expected without a hostname: %q", res.ComposeYAML)
-	}
-	if strings.Contains(res.ComposeYAML, "MINIO_BROWSER_REDIRECT_URL") {
-		t.Fatalf("no MINIO_BROWSER_REDIRECT_URL expected without a console url: %q", res.ComposeYAML)
+	if !strings.Contains(res.ComposeYAML, "name: 1234_garage_data") {
+		t.Fatalf("expected tracked external volume name in compose: %q", res.ComposeYAML)
 	}
 }
 

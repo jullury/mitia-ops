@@ -18,7 +18,7 @@ func TestServiceCRUD(t *testing.T) {
 	}
 	defer d.Close()
 
-	id, err := d.CreateService("minio", "main")
+	id, err := d.CreateService("garage", "main")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -27,8 +27,8 @@ func TestServiceCRUD(t *testing.T) {
 	}
 
 	if err := d.SetConfigItems(id, []ConfigItem{
-		{Key: "MINIO_ROOT_USER", Value: "admin"},
-		{Key: "MINIO_ROOT_PASSWORD", Value: "secret123"},
+		{Key: "GARAGE_ROOT_USER", Value: "admin"},
+		{Key: "GARAGE_ROOT_PASSWORD", Value: "secret123"},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -37,15 +37,15 @@ func TestServiceCRUD(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if items["MINIO_ROOT_USER"] != "admin" {
-		t.Fatalf("unexpected value: %q", items["MINIO_ROOT_USER"])
+	if items["GARAGE_ROOT_USER"] != "admin" {
+		t.Fatalf("unexpected value: %q", items["GARAGE_ROOT_USER"])
 	}
 
 	list, err := d.ListServices()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(list) != 1 || list[0].Kind != "minio" || !list[0].Enabled {
+	if len(list) != 1 || list[0].Kind != "garage" || !list[0].Enabled {
 		t.Fatalf("unexpected list: %+v", list)
 	}
 }
@@ -53,7 +53,7 @@ func TestServiceCRUD(t *testing.T) {
 func TestDeleteServiceCascades(t *testing.T) {
 	d, _ := Open(filepath.Join(t.TempDir(), "test.db"))
 	defer d.Close()
-	id, _ := d.CreateService("minio", "x")
+	id, _ := d.CreateService("garage", "x")
 	_ = d.SetConfigItems(id, []ConfigItem{{Key: "K", Value: "V"}})
 	// verify FK pragma is on so the cascade below actually runs
 	if !d.ForeignKeysEnabled() {
@@ -107,7 +107,7 @@ func TestDeleteConfigItems(t *testing.T) {
 		t.Fatal(err)
 	}
 	// service scoping: no error when another service has no such keys
-	other, _ := d.CreateService("minio", "m")
+	other, _ := d.CreateService("garage", "m")
 	_ = d.SetConfigItems(other, []ConfigItem{{Key: "CF_INGRESS_0_HOST", Value: "x"}})
 	if err := d.DeleteConfigItems(other, []string{"CF_INGRESS_0_HOST"}); err != nil {
 		t.Fatal(err)
@@ -130,9 +130,9 @@ func TestMigrateLegacyIDs(t *testing.T) {
 	for _, q := range []string{
 		`CREATE TABLE services (id INTEGER PRIMARY KEY, kind TEXT NOT NULL, name TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1);`,
 		`CREATE TABLE config_items (id INTEGER PRIMARY KEY, service_id INTEGER NOT NULL REFERENCES services(id) ON DELETE CASCADE, key TEXT NOT NULL, value TEXT NOT NULL, UNIQUE(service_id, key));`,
-		`INSERT INTO services (id, kind, name) VALUES (1, 'cloudflared', 'tun'), (2, 'minio', 'main');`,
-		`INSERT INTO config_items (service_id, key, value) VALUES (2, 'MINIO_ROOT_USER', 'admin');`,
-		`INSERT INTO config_items (service_id, key, value) VALUES (2, 'MINIO_VOLUME_NAME', '2_minio_data');`,
+		`INSERT INTO services (id, kind, name) VALUES (1, 'cloudflared', 'tun'), (2, 'garage', 'main');`,
+		`INSERT INTO config_items (service_id, key, value) VALUES (2, 'GARAGE_ROOT_USER', 'admin');`,
+		`INSERT INTO config_items (service_id, key, value) VALUES (2, 'GARAGE_VOLUME_NAME', '2_garage_data');`,
 	} {
 		if _, err := raw.Exec(q); err != nil {
 			t.Fatal(err)
@@ -174,25 +174,25 @@ func TestMigrateLegacyIDs(t *testing.T) {
 	if len(svcs) != 2 {
 		t.Fatalf("expected 2 services after migration, got %d", len(svcs))
 	}
-	var minioID string
+	var garageID string
 	for _, svc := range svcs {
 		if !uuidRe.MatchString(svc.ID) {
 			t.Fatalf("service id should be a UUID, got %q", svc.ID)
 		}
-		if svc.Kind == "minio" {
-			minioID = svc.ID
+		if svc.Kind == "garage" {
+			garageID = svc.ID
 		}
 	}
-	if pending["2"] != minioID {
-		t.Fatalf("remap for legacy id 2 = %q, want %q", pending["2"], minioID)
+	if pending["2"] != garageID {
+		t.Fatalf("remap for legacy id 2 = %q, want %q", pending["2"], garageID)
 	}
-	if items, _ := d.ConfigItems(minioID); items["MINIO_ROOT_USER"] != "admin" {
+	if items, _ := d.ConfigItems(garageID); items["GARAGE_ROOT_USER"] != "admin" {
 		t.Fatalf("config items must follow the service to its new id, got %+v", items)
 	}
 	// Values embedding the legacy id (project-scoped volume names) are
 	// rewritten to the new prefix and keep matching the migrated volumes.
-	if items, _ := d.ConfigItems(minioID); items["MINIO_VOLUME_NAME"] != minioID+"_minio_data" {
-		t.Fatalf("volume-name values must be rewritten to the new id, got %q", items["MINIO_VOLUME_NAME"])
+	if items, _ := d.ConfigItems(garageID); items["GARAGE_VOLUME_NAME"] != garageID+"_garage_data" {
+		t.Fatalf("volume-name values must be rewritten to the new id, got %q", items["GARAGE_VOLUME_NAME"])
 	}
 
 	// Idempotent: a second run is a no-op.
@@ -210,5 +210,69 @@ func TestMigrateLegacyIDs(t *testing.T) {
 	}
 	if p, _ := d.PendingMigrations(); len(p) != 0 {
 		t.Fatalf("expected no pending migrations after completion, got %v", p)
+	}
+}
+
+func TestMigrateMinioToGarage(t *testing.T) {
+	d, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+
+	id, err := d.CreateService("minio", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.SetConfigItems(id, []ConfigItem{
+		{Key: "MINIO_HOSTNAME", Value: "s3.example.com"},
+		{Key: "MINIO_VOLUME_SIZE", Value: "100G"},
+		{Key: "MINIO_VOLUME_NAME", Value: "3_minio_data"},
+		{Key: "minio_backup_buckets", Value: "photos,docs"},
+		{Key: "MINIO_ROOT_USER", Value: "admin"},
+		{Key: "MINIO_ROOT_PASSWORD", Value: "secret"},
+		{Key: "MINIO_CONSOLE_URL", Value: "https://console.example.com"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := d.MigrateMinioToGarage(); err != nil {
+		t.Fatal(err)
+	}
+
+	svc, err := d.ServiceByID(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if svc.Kind != "garage" {
+		t.Fatalf("kind = %q, want %q", svc.Kind, "garage")
+	}
+	items, err := d.ConfigItems(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for k, want := range map[string]string{
+		"GARAGE_HOSTNAME":       "s3.example.com",
+		"GARAGE_VOLUME_SIZE":    "100G",
+		"GARAGE_VOLUME_NAME":    "3_minio_data",
+		"garage_backup_buckets": "photos,docs",
+	} {
+		if items[k] != want {
+			t.Fatalf("item %s = %q, want %q", k, items[k], want)
+		}
+	}
+	for _, gone := range []string{"MINIO_HOSTNAME", "MINIO_VOLUME_SIZE", "MINIO_VOLUME_NAME", "minio_backup_buckets", "MINIO_ROOT_USER", "MINIO_ROOT_PASSWORD", "MINIO_CONSOLE_URL"} {
+		if _, ok := items[gone]; ok {
+			t.Fatalf("legacy key %s must not remain after migration", gone)
+		}
+	}
+
+	// Idempotent: a second run is a no-op and preserves the garage state.
+	if err := d.MigrateMinioToGarage(); err != nil {
+		t.Fatal(err)
+	}
+	svc, _ = d.ServiceByID(id)
+	if svc.Kind != "garage" {
+		t.Fatalf("kind changed on second run: %q", svc.Kind)
 	}
 }

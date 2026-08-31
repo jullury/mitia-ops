@@ -31,13 +31,12 @@ func TestRegenerateComposePinsMigratedVolume(t *testing.T) {
 	}
 	defer d.Close()
 
-	id, err := d.CreateService("minio", "main")
+	id, err := d.CreateService("garage", "main")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := d.SetConfigItems(id, []db.ConfigItem{
-		{Key: "MINIO_HOSTNAME", Value: "s3.example.com"},
-		{Key: "MINIO_ROOT_USER", Value: "admin"},
+		{Key: "GARAGE_HOSTNAME", Value: "s3.example.com"},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -50,15 +49,15 @@ func TestRegenerateComposePinsMigratedVolume(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(out), "name: "+id+"_minio_data") {
-		t.Fatalf("compose should mount the id-scoped volume name %s: %s", id+"_minio_data", out)
+	if !strings.Contains(string(out), "name: "+id+"_garage_data") {
+		t.Fatalf("compose should mount the id-scoped volume name %s: %s", id+"_garage_data", out)
 	}
-	if !strings.Contains(string(out), "s3.example.com") {
-		t.Fatalf("hostname from config should be preserved: %s", out)
+	if !strings.Contains(string(out), "garage_data:/srv/garage") {
+		t.Fatalf("compose should mount garage_data to /srv/garage: %s", out)
 	}
 
 	// A stored volume name wins over the derived one (post-resize tracking).
-	if err := d.SetConfigItems(id, []db.ConfigItem{{Key: "MINIO_VOLUME_NAME", Value: "custom_data"}}); err != nil {
+	if err := d.SetConfigItems(id, []db.ConfigItem{{Key: "GARAGE_VOLUME_NAME", Value: "custom_data"}}); err != nil {
 		t.Fatal(err)
 	}
 	if err := regenerateCompose(d, dir, id); err != nil {
@@ -69,6 +68,6 @@ func TestRegenerateComposePinsMigratedVolume(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !strings.Contains(string(out), "name: custom_data") {
-		t.Fatalf("stored MINIO_VOLUME_NAME should be referenced: %s", out)
+		t.Fatalf("stored GARAGE_VOLUME_NAME should be referenced: %s", out)
 	}
 }

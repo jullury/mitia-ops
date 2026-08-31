@@ -11,7 +11,7 @@ func TestRegistryContainsServices(t *testing.T) {
 	for _, d := range defs {
 		byKind[d.Kind] = d
 	}
-	for _, k := range []Kind{KindMinio, KindMailcow, KindCaddy, KindCloudflared, KindPostgres, KindVault} {
+	for _, k := range []Kind{KindGarage, KindMailcow, KindCaddy, KindCloudflared, KindPostgres, KindVault} {
 		if _, ok := byKind[k]; !ok {
 			t.Fatalf("missing definition for %s", k)
 		}
@@ -31,19 +31,31 @@ func TestDefaultValuesPresent(t *testing.T) {
 	}
 }
 
-func TestSecretFieldMarked(t *testing.T) {
-	def, ok := Get(KindMinio)
+func TestGarageFields(t *testing.T) {
+	def, ok := Get(KindGarage)
 	if !ok {
-		t.Fatal("minio definition missing")
+		t.Fatal("garage definition missing")
 	}
-	found := false
-	for _, f := range def.Fields {
-		if f.Key == "MINIO_ROOT_PASSWORD" && f.Type == FieldSecret {
-			found = true
+	keys := map[string]bool{}
+	var size *Field
+	for i := range def.Fields {
+		f := &def.Fields[i]
+		keys[f.Key] = true
+		if f.Key == "GARAGE_VOLUME_SIZE" {
+			size = f
 		}
 	}
-	if !found {
-		t.Fatal("MINIO_ROOT_PASSWORD should be a secret field")
+	for _, want := range []string{"GARAGE_HOSTNAME", "GARAGE_VOLUME_SIZE"} {
+		if !keys[want] {
+			t.Fatalf("garage missing field %s (have %v)", want, keys)
+		}
+	}
+	// No credential fields: the S3 access key is auto-generated on launch.
+	if keys["GARAGE_ACCESS_KEY_ID"] || keys["GARAGE_SECRET_ACCESS_KEY"] {
+		t.Fatalf("garage must not expose credential form fields: %v", keys)
+	}
+	if size == nil || size.Type != FieldSize || len(size.Units) == 0 {
+		t.Fatalf("garage must declare a FieldSize volume (resize preflight), got %+v", size)
 	}
 }
 

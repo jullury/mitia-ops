@@ -22,14 +22,14 @@ func (f *fakeRunner) Run(dir string, args ...string) (string, error) {
 
 func TestUpCallsCompose(t *testing.T) {
 	f := &fakeRunner{out: "started"}
-	got, err := Up("/srv/minio", f)
+	got, err := Up("/srv/garage", f)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got != "started" {
 		t.Fatalf("unexpected output: %q", got)
 	}
-	if f.dir != "/srv/minio" {
+	if f.dir != "/srv/garage" {
 		t.Fatalf("unexpected dir: %q", f.dir)
 	}
 	if !contains(f.args, "up") || !contains(f.args, "-d") {
