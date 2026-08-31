@@ -1,6 +1,14 @@
 # Changelog
 
 
+## [1.6.0](https://github.com/jullury/mitia-ops/compare/v1.5.0...v1.6.0) (2026-08-31)
+
+
+### Features
+
+* **auth:** protect dashboard with HTTP Basic Auth ([56501aa](https://github.com/jullury/mitia-ops/commit/56501aa19c71bf46d7509d080683f077b906ab9d))
+* **cli:** add 'update' subcommand to self-upgrade to latest release ([d5e4a19](https://github.com/jullury/mitia-ops/commit/d5e4a192b564ac7153e993a2fcea766b85d932ed))
+
 ## [1.5.0](https://github.com/jullury/mitia-ops/compare/v1.4.1...v1.5.0) (2026-08-31)
 
 
