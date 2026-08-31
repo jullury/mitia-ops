@@ -54,10 +54,11 @@ jobs:
         env:
           GOOS: ${{ matrix.os }}
           GOARCH: ${{ matrix.arch }}
+          VERSION: ${{ needs.release-please.outputs.tag_name }}
         run: |
           out="mitia-ops-$GOOS-$GOARCH"
           mkdir -p dist
-          CGO_ENABLED=0 go build -ldflags "-s -w" -o "dist/$out" ./cmd/server
+          CGO_ENABLED=0 go build -ldflags "-X main.version=${VERSION} -s -w" -o "dist/$out" ./cmd/server
           echo "out=$out" >> "$GITHUB_ENV"
 
       - name: Upload artifact

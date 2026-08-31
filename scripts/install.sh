@@ -24,6 +24,9 @@ ETC_DIR="/etc/mitia-ops"
 ENV_FILE="$ETC_DIR/env"
 KEY_FILE="$ETC_DIR/key"
 UNIT_DST="/etc/systemd/system/mitia-ops.service"
+# Pin a specific release (e.g. MITIAOPS_VERSION=v1.2.2) instead of resolving
+# `latest`; else the latest GitHub release is installed. Defaults to "latest".
+VERSION="${MITIAOPS_VERSION:-latest}"
 
 if [ "$(id -u)" -ne 0 ]; then
 	echo "run as root (e.g. 'sudo make install')" >&2
@@ -62,8 +65,13 @@ if [ ! -x "$BIN_SRC" ]; then
 		darwin:arm64) asset="mitia-ops-darwin-arm64" ;;
 		*) echo "unsupported platform: $local_os/$local_arch" >&2; exit 1 ;;
 	esac
-	echo "downloading latest release binary ($asset)"
-	fetch_binary "https://github.com/jullury/mitia-ops/releases/latest/download/$asset"
+	if [ "$VERSION" = "latest" ]; then
+		url="https://github.com/jullury/mitia-ops/releases/latest/download/$asset"
+	else
+		url="https://github.com/jullury/mitia-ops/releases/download/$VERSION/$asset"
+	fi
+	echo "downloading $VERSION binary ($url)"
+	fetch_binary "$url"
 fi
 
 # --- master key ------------------------------------------------------------
@@ -162,6 +170,7 @@ fi
 systemctl --no-pager --full status mitia-ops || true
 echo
 echo "installed: $BIN_DST, unit=$UNIT_DST, cwd=$PREFIX, env=$ENV_FILE"
+echo "binary version: $($BIN_DST --version 2>/dev/null || echo unknown)"
 echo "lock the dashboard to localhost and reach it over an SSH tunnel:"
 echo "  echo MITIAOPS_ADDR=127.0.0.1:8080 >> $ENV_FILE && systemctl restart mitia-ops"
 echo "  ssh -L 8080:127.0.0.1:8080 user@vps"

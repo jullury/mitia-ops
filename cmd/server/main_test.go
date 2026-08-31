@@ -9,6 +9,23 @@ import (
 	"github.com/jullury/mitia-ops/internal/db"
 )
 
+func TestVersionFlag(t *testing.T) {
+	old := version
+	version = "vTest-1.2.3"
+	defer func() { version = old }()
+
+	for _, args := range [][]string{{"-version"}, {"--version"}, {"--version", "ignored"}} {
+		if !versionFlag(args) {
+			t.Errorf("versionFlag(%v) = false, want true", args)
+		}
+	}
+	for _, args := range [][]string{nil, {}, {"serve"}, {"-v"}} {
+		if versionFlag(args) {
+			t.Errorf("versionFlag(%v) = true, want false", args)
+		}
+	}
+}
+
 func TestLoadDotEnv(t *testing.T) {
 	p := filepath.Join(t.TempDir(), ".env")
 	os.WriteFile(p, []byte("# comment\n\nFOO=bar\nEMPTY=\n"), 0o600)

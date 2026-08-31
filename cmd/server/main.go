@@ -19,6 +19,13 @@ import (
 	"github.com/jullury/mitia-ops/internal/web"
 )
 
+// version is the release tag (or a "vX.Y.Z-N-gHASH" describe string) this
+// binary was built from. It is stamped at build time via
+//
+//	-ldflags "-X main.version=..." (see the Makefile and release workflow) and
+//	printed by the `--version` flag so an operator can verify what is deployed.
+var version = "dev"
+
 // resizeVolumeNames mirrors web.resizeVolumeNames: kinds whose named volume is
 // project-scoped and thus embedded in the rendered compose as an external
 // volume name that follows the deploy dir (i.e. the service id).
@@ -155,7 +162,24 @@ func loadDotEnv(path string) {
 	}
 }
 
+// versionFlag reports whether the single CLI flag `-version`/`--version` was
+// passed, i.e. the user asked merely to print the build version and exit.
+func versionFlag(args []string) bool {
+	for _, a := range args {
+		if a == "-version" || a == "--version" {
+			return true
+		}
+	}
+	return false
+}
+
 func main() {
+	// Print the build version and exit; this must work even when the runtime
+	// prerequisites (MITIAOPS_KEY, docker, etc.) are absent.
+	if versionFlag(os.Args[1:]) {
+		fmt.Println(version)
+		return
+	}
 	if isUninstall(os.Args[1:]) {
 		if err := uninstall(os.Args[1:]); err != nil {
 			log.Fatal(err)
