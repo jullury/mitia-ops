@@ -26,7 +26,7 @@ KEY_FILE="$ETC_DIR/key"
 UNIT_SRC="packaging/mitia-ops.service"
 UNIT_DST="/etc/systemd/system/mitia-ops.service"
 
-if [[ "$(id -u)" -ne 0 ]]; then
+if [ "$(id -u)" -ne 0 ]; then
 	echo "run as root (e.g. 'sudo make install')" >&2
 	exit 1
 fi
@@ -36,8 +36,7 @@ fi
 # OS/arch. This is what makes a fresh machine a one-liner instead of needing a
 # Go toolchain.
 fetch_binary() {
-	local url="$1"
-	local tmp
+	url="$1"
 	tmp="$(mktemp)"
 	if command -v curl >/dev/null 2>&1; then
 		curl -fsSL "$url" -o "$tmp"
@@ -52,7 +51,7 @@ fetch_binary() {
 	rm -f "$tmp"
 }
 
-if [[ ! -x "$BIN_SRC" ]]; then
+if [ ! -x "$BIN_SRC" ]; then
 	# Resolve the latest release asset name for this platform.
 	local_os="$(uname -s | tr '[:upper:]' '[:lower:]')"
 	local_arch="$(uname -m)"
@@ -77,11 +76,11 @@ fi
 #   * else an existing key file wins,
 #   * else, only when nothing encrypted exists to preserve, we generate a key.
 mkdir -p "$ETC_DIR"
-if [[ -f "$ENV_FILE" ]]; then
+if [ -f "$ENV_FILE" ]; then
 	: # operator-managed env (MITIAOPS_KEY and/or MITIAOPS_KEY_FILE) — keep it
-elif [[ -f "$KEY_FILE" ]]; then
+elif [ -f "$KEY_FILE" ]; then
 	: # previous install generated one — keep it
-elif [[ -e "$PREFIX/data" && -e "$PREFIX/data/mitiaops.db" ]]; then
+elif [ -e "$PREFIX/data" ] && [ -e "$PREFIX/data/mitiaops.db" ]; then
 	echo "WARNING: existing encrypted store found at $PREFIX/data/mitiaops.db but no" >&2
 	echo "master key under $ETC_DIR. Refusing to invent one (it would lock you out)." >&2
 	echo "Set your existing key first, e.g.:" >&2
@@ -104,11 +103,11 @@ install -m 0755 -o root -g root "$BIN_SRC" "$BIN_DST"
 
 # Migrate an existing checkout's runtime data only when the target is empty;
 # never clobber whatever the service already manages in /var/lib/mitia-ops.
-if [[ -d data && ! -e "$PREFIX/data" ]]; then
+if [ -d data ] && [ ! -e "$PREFIX/data" ]; then
 	cp -a data "$PREFIX/data"
 	echo "../data -> $PREFIX/data"
 fi
-if [[ -d deployments && ! -e "$PREFIX/deployments" ]]; then
+if [ -d deployments ] && [ ! -e "$PREFIX/deployments" ]; then
 	cp -a deployments "$PREFIX/deployments"
 	echo "../deployments -> $PREFIX/deployments"
 fi
@@ -126,7 +125,7 @@ systemctl enable mitia-ops >/dev/null
 # port — stop it first so the unit takes over cleanly.
 if command -v pgrep >/dev/null 2>&1; then
 	UNSUPERVISED=$(pgrep -f "$BIN_DST" || true)
-	if [[ -n "$UNSUPERVISED" && -z "$(systemctl is-active mitia-ops 2>/dev/null || true)" ]]; then
+	if [ -n "$UNSUPERVISED" ] && [ -z "$(systemctl is-active mitia-ops 2>/dev/null || true)" ]; then
 		echo "stopping an unsupervised mitia-ops so systemd can take over"
 		kill $UNSUPERVISED
 	fi
