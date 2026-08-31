@@ -1,6 +1,14 @@
 # Changelog
 
 
+## [1.4.0](https://github.com/jullury/mitia-ops/compare/v1.3.0...v1.4.0) (2026-08-31)
+
+
+### Features
+
+* **cli:** add 'uninstall' subcommand ([218bcd3](https://github.com/jullury/mitia-ops/commit/218bcd307c2b79fad02657dce622e3c1be5aa477))
+* **cli:** add version-stamped '--version' flag for deployed-build checks ([5018300](https://github.com/jullury/mitia-ops/commit/50183004f75609ad0c1832e7ad9b1114ee5fa2e8))
+
 ## [1.3.0](https://github.com/jullury/mitia-ops/compare/v1.2.2...v1.3.0) (2026-08-31)
 
 
