@@ -126,7 +126,7 @@ func TestRunsCloudflaredViaContainer(t *testing.T) {
 	for _, want := range []string{
 		"run", "--rm",
 		"-v " + home + ":" + "/home/nonroot/.cloudflared",
-		"cloudflare/cloudflared:latest",
+		CloudflaredImage,
 		"tunnel create --output json my-tunnel",
 	} {
 		if !strings.Contains(joined, want) {
@@ -326,7 +326,7 @@ func TestLoginURL(t *testing.T) {
 	home := t.TempDir()
 	raw := &scriptedRunner{responses: map[string]string{
 		"rm -f " + loginContainerName: "",
-		"run -d --rm --name " + loginContainerName + " -p 4979:4979 -v " + home + ":/home/nonroot/.cloudflared cloudflare/cloudflared:latest tunnel login": "container-id",
+		"run -d --rm --name " + loginContainerName + " -p 4979:4979 -v " + home + ":/home/nonroot/.cloudflared " + CloudflaredImage + " tunnel login": "container-id",
 		"logs " + loginContainerName: loginLogWithURL(testLoginURL),
 	}}
 	c := New()
@@ -347,7 +347,7 @@ func TestLoginURLWaitsForLog(t *testing.T) {
 	calls := 0
 	raw := &scriptedRunner{responses: map[string]string{
 		"rm -f " + loginContainerName: "",
-		"run -d --rm --name " + loginContainerName + " -p 4979:4979 -v " + home + ":/home/nonroot/.cloudflared cloudflare/cloudflared:latest tunnel login": "container-id",
+		"run -d --rm --name " + loginContainerName + " -p 4979:4979 -v " + home + ":/home/nonroot/.cloudflared " + CloudflaredImage + " tunnel login": "container-id",
 	}}
 	c := New()
 	c.Home = home

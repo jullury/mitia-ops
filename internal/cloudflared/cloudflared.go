@@ -18,6 +18,11 @@ import (
 	"github.com/jullury/mitia-ops/internal/docker"
 )
 
+// CloudflaredImage is the pinned cloudflared container image and tag used both
+// by the CLI runner and the generated compose file, so the version lives in one
+// place and upgrades are deliberate (bump here + re-release).
+const CloudflaredImage = "cloudflare/cloudflared:2026.8.2"
+
 // containerHome is where cloudflared looks for its state inside the official
 // image: the image sets its WorkingDir to /home/nonroot and its passwd entry
 // maps the non-root user (uid 65532) there, so per-user state is ~/.cloudflared.
@@ -81,7 +86,7 @@ func (c *CLI) image() string {
 	if c.Image != "" {
 		return c.Image
 	}
-	return "cloudflare/cloudflared:latest"
+	return CloudflaredImage
 }
 
 func (c *CLI) home() string {

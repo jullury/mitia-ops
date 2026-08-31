@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+
+	"github.com/jullury/mitia-ops/internal/cloudflared"
 )
 
 // ingressColumns are the per-row inputs of the CF_INGRESS traffic-routing list.
@@ -88,7 +90,7 @@ func CloudflaredIngressHosts(values map[string]string) []string {
 func cloudflaredCompose() string {
 	return `services:
   cloudflared:
-    image: cloudflare/cloudflared:latest
+    image: ` + cloudflared.CloudflaredImage + `
     restart: unless-stopped
     command: tunnel run
     network_mode: host
