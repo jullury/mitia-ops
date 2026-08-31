@@ -23,7 +23,6 @@ PREFIX="/var/lib/mitia-ops"
 ETC_DIR="/etc/mitia-ops"
 ENV_FILE="$ETC_DIR/env"
 KEY_FILE="$ETC_DIR/key"
-UNIT_SRC="packaging/mitia-ops.service"
 UNIT_DST="/etc/systemd/system/mitia-ops.service"
 
 if [ "$(id -u)" -ne 0 ]; then
@@ -113,7 +112,29 @@ if [ -d deployments ] && [ ! -e "$PREFIX/deployments" ]; then
 fi
 
 # --- unit ------------------------------------------------------------------
-install -m 0644 -o root -g root "$UNIT_SRC" "$UNIT_DST"
+# Written inline (not copied from the repo) so the one-liner works from any
+# working directory — the unit file is self-contained and fixed.
+cat > "$UNIT_DST" <<'EOF'
+[Unit]
+Description=mitia-ops - single-binary dashboard for self-hosted services
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/var/lib/mitia-ops
+EnvironmentFile=/etc/mitia-ops/env
+ExecStart=/usr/local/bin/mitia-ops
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+chmod 0644 "$UNIT_DST"
 if command -v systemd-analyze >/dev/null 2>&1; then
 	systemd-analyze verify "$UNIT_DST"
 fi
