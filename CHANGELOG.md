@@ -1,6 +1,13 @@
 # Changelog
 
 
+## [1.3.0](https://github.com/jullury/mitia-ops/compare/v1.2.2...v1.3.0) (2026-08-31)
+
+
+### Features
+
+* **garage:** replace MinIO with Garage S3 and finish first-boot setup ([93c8f39](https://github.com/jullury/mitia-ops/commit/93c8f39bcd0505e879f5d4278326d9366e7bb6d2))
+
 ## [Unreleased]
 
 ### BREAKING CHANGES
