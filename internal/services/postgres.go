@@ -54,7 +54,7 @@ func postgresCompose(v map[string]string) string {
 	}
 	return `services:
   postgres:
-    image: postgres:16-alpine
+    image: ` + postgresImage + `
     restart: unless-stopped
     ports:
       - "` + port + `:5432"

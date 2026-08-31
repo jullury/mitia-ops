@@ -73,7 +73,7 @@ func vaultCompose(v map[string]string) string {
 	}
 	return `services:
   vault:
-    image: hashicorp/vault:latest
+    image: ` + vaultImage + `
     command: server
     restart: unless-stopped
     cap_add:

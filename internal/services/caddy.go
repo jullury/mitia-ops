@@ -29,7 +29,7 @@ func caddyEnv(v map[string]string) string {
 func caddyCompose(v map[string]string) string {
 	return `services:
   caddy:
-    image: caddy:2
+    image: ` + caddyImage + `
     restart: unless-stopped
     ports:
       - "80:80"

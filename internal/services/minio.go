@@ -47,7 +47,7 @@ func minioCompose(v map[string]string) string {
 	var b strings.Builder
 	b.WriteString(`services:
   minio:
-    image: minio/minio:latest
+    image: ` + minioImage + `
     command: server /data --console-address ":9001"
     restart: unless-stopped
     ports:
