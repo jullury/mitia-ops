@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.2.1](https://github.com/jullury/mitia-ops/compare/v1.2.0...v1.2.1) (2026-08-31)
+
+
+### Bug Fixes
+
+* **install:** embed systemd unit so one-liner works without checkout ([09f9f3e](https://github.com/jullury/mitia-ops/commit/09f9f3e2f0b9b3c2727e80be44da21823b5a9867))
+
 ## [1.2.0](https://github.com/jullury/mitia-ops/compare/v1.1.0...v1.2.0) (2026-08-31)
 
 
