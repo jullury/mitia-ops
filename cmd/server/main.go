@@ -186,6 +186,12 @@ func main() {
 		}
 		return
 	}
+	if isUpdate(os.Args[1:]) {
+		if err := update(os.Args[1:]); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
 
 	loadDotEnv(".env")
 	masterKey := os.Getenv("MITIAOPS_KEY")

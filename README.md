@@ -138,6 +138,20 @@ it is stopped first so systemd can take over the listen port.
 Boot order: host boots → systemd starts mitia-ops → `AutoStart()` re-ups every
 service flagged *Start on boot* → your stack is reachable again.
 
+**Check and self-update a deployed install:**
+
+```sh
+/usr/local/bin/mitia-ops --version     # prints the installed version
+sudo /usr/local/bin/mitia-ops update   # redownload the latest release, replace the
+                                       # binary, and restart the systemd unit
+```
+
+`mitia-ops update` fetches the newest released binary for this OS/arch, swaps it
+into `/usr/local/bin/mitia-ops` (a fresh download always wins over any stale
+local copy), and restarts the systemd service so the new version takes effect.
+`--version` works on binaries built from v1.4.0 and later; older ones report
+nothing and print a `MITIAOPS_KEY` error instead.
+
 ## Releases & versioning
 
 Versions are **bumped automatically** — no manual tagging required. On every
