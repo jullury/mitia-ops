@@ -145,6 +145,10 @@ the GitHub Release. So please write commit messages in conventional style (the
 repo's existing history already is) and let `main` decide when to ship. To check
 what the next release will look like, open the most recent release PR.
 
+> **Supported platforms.** Pre-built release binaries are produced for
+> **Linux** (amd64 / arm64 / arm) and **macOS** (amd64 / arm64) only.
+> **Windows is not supported** — no Windows binary is built or published.
+
 **Accessing the dashboard on a headless VPS.** By default the dashboard binds
 `MITIAOPS_ADDR` (default `:8080`) on **all** interfaces. On a public VPS you
 usually want it reachable only from your workstation — bind to loopback and

@@ -41,8 +41,6 @@ jobs:
             arch: amd64
           - os: darwin
             arch: arm64
-          - os: windows
-            arch: amd64
     steps:
       - uses: actions/checkout@v4
         with:
@@ -57,9 +55,7 @@ jobs:
           GOOS: ${{ matrix.os }}
           GOARCH: ${{ matrix.arch }}
         run: |
-          ext=""
-          [ "$GOOS" = "windows" ] && ext=".exe"
-          out="mitia-ops-$GOOS-$GOARCH$ext"
+          out="mitia-ops-$GOOS-$GOARCH"
           mkdir -p dist
           CGO_ENABLED=0 go build -ldflags "-s -w" -o "dist/$out" ./cmd/server
           echo "out=$out" >> "$GITHUB_ENV"
