@@ -14,6 +14,13 @@
 #   sudo ./scripts/install.sh
 #   # or one-liner:
 #   curl -fsSL https://raw.githubusercontent.com/jullury/mitia-ops/main/scripts/install.sh | sudo bash
+#
+# The one-liner runs from your current directory, so a leftover/older
+# `output/mitia-ops` there would otherwise be installed instead of the latest
+# release. Set MITIAOPS_FORCE_DOWNLOAD=1 to always delete that local binary and
+# redownload the newest release:
+#   MITIAOPS_FORCE_DOWNLOAD=1 curl -fsSL https://raw.githubusercontent.com/jullury/mitia-ops/main/scripts/install.sh | sudo bash
+# Pin a specific release with MITIAOPS_VERSION=v1.2.2 to install an exact tag.
 
 set -euo pipefail
 
@@ -27,6 +34,12 @@ UNIT_DST="/etc/systemd/system/mitia-ops.service"
 # Pin a specific release (e.g. MITIAOPS_VERSION=v1.2.2) instead of resolving
 # `latest`; else the latest GitHub release is installed. Defaults to "latest".
 VERSION="${MITIAOPS_VERSION:-latest}"
+# When set, always redownload the release binary (and delete any stale local
+# `output/mitia-ops`) instead of installing a pre-built one. This is how the
+# curl one-liner guarantees a fresh latest install even if a leftover binary
+# sits in the working directory:
+#   MITIAOPS_FORCE_DOWNLOAD=1 curl -fsSL .../install.sh | sudo bash
+FORCE_DOWNLOAD="${MITIAOPS_FORCE_DOWNLOAD:-0}"
 
 if [ "$(id -u)" -ne 0 ]; then
 	echo "run as root (e.g. 'sudo make install')" >&2
@@ -34,9 +47,9 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 # --- binary ----------------------------------------------------------------
-# Prefer a locally-built binary; otherwise download the latest release for this
-# OS/arch. This is what makes a fresh machine a one-liner instead of needing a
-# Go toolchain.
+# Prefer a locally-built binary unless FORCE_DOWNLOAD is set; otherwise download
+# the latest release for this OS/arch. This is what makes a fresh machine a
+# one-liner instead of needing a Go toolchain.
 fetch_binary() {
 	url="$1"
 	tmp="$(mktemp)"
@@ -53,7 +66,10 @@ fetch_binary() {
 	rm -f "$tmp"
 }
 
-if [ ! -x "$BIN_SRC" ]; then
+if [ "$FORCE_DOWNLOAD" = "1" ] || [ ! -x "$BIN_SRC" ]; then
+	# FORCE_DOWNLOAD: a stale local build must never win over the release
+	# binary, so drop it before fetching the fresh one.
+	[ "$FORCE_DOWNLOAD" = "1" ] && rm -f "$BIN_SRC"
 	# Resolve the latest release asset name for this platform.
 	local_os="$(uname -s | tr '[:upper:]' '[:lower:]')"
 	local_arch="$(uname -m)"

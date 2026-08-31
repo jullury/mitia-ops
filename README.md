@@ -90,6 +90,18 @@ binary for your OS/arch from the GitHub release, and installs it as a systemd
 service. You will be prompted for your password (by `sudo`) before installation
 starts.
 
+The one-liner runs from your current directory, so a leftover/older
+`output/mitia-ops` there would otherwise be installed instead of the latest
+release. To always delete that local binary and redownload the newest release,
+prefix the command with `MITIAOPS_FORCE_DOWNLOAD=1`:
+
+```sh
+MITIAOPS_FORCE_DOWNLOAD=1 curl -fsSL https://raw.githubusercontent.com/jullury/mitia-ops/refs/heads/main/scripts/install.sh | sudo sh
+```
+
+Pin an exact release with `MITIAOPS_VERSION=v1.2.2` (e.g. for reproducible
+rollbacks) instead of resolving `latest`.
+
 **Or clone the repo and run `install.sh` directly:**
 
 ```sh
