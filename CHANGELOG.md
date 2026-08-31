@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.1.0](https://github.com/jullury/mitia-ops/compare/v1.0.0...v1.1.0) (2026-08-31)
+
+
+### Features
+
+* **backups:** per-service snapshot backup, restore, and scheduling ([38a2115](https://github.com/jullury/mitia-ops/commit/38a2115e79792b21b90426940b7c82ec9821f723))
+* **services:** add hashicorp vault (sealed production mode) ([135eb38](https://github.com/jullury/mitia-ops/commit/135eb3881dc3c8fb56ada4437016dea82ddf95e5))
+* **services:** add postgres with volume-size launch guard ([d4cd2f2](https://github.com/jullury/mitia-ops/commit/d4cd2f2c994c857cd170dd213b27a7ee1b8b7b88))
+
 ## 1.0.0 (2026-08-29)
 
 
