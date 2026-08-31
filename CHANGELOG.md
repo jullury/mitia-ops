@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.2.0](https://github.com/jullury/mitia-ops/compare/v1.1.0...v1.2.0) (2026-08-31)
+
+
+### Features
+
+* **backups:** per-bucket minio backup with ui toggles ([4e2f56a](https://github.com/jullury/mitia-ops/commit/4e2f56ae27d0765c8dfbd4b451cb64561efd8fcd))
+
+
+### Bug Fixes
+
+* **install:** make installer POSIX sh compatible ([52bb9d2](https://github.com/jullury/mitia-ops/commit/52bb9d2635647431a78d340b65825da9539eb2fc))
+
 ## [1.1.0](https://github.com/jullury/mitia-ops/compare/v1.0.0...v1.1.0) (2026-08-31)
 
 
