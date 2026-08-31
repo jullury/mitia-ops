@@ -47,6 +47,9 @@ type Config struct {
 	// | "weekly" | "@hourly". Per-service overrides win when "inherit" or a
 	// concrete value is chosen.
 	BackupSchedule string
+	// Password is the HTTP Basic Auth password for the dashboard. When empty,
+	// no authentication is enforced.
+	Password string
 }
 
 // CloudflaredCLI is the subset of the cloudflared binary the app drives when
@@ -64,6 +67,23 @@ type CloudflaredCLI interface {
 	// RouteDNS points the DNS CNAME for hostname at the named tunnel
 	// (idempotently), so saved ingress hostnames actually route to it.
 	RouteDNS(tunnel, hostname string) error
+}
+
+// basicAuth wraps an http.Handler, requiring HTTP Basic Auth with the given
+// password. When password is empty the middleware is a no-op passthrough.
+func basicAuth(next http.Handler, password string) http.Handler {
+	if password == "" {
+		return next
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		u, p, ok := r.BasicAuth()
+		if !ok || u != "admin" || p != password {
+			w.Header().Set("WWW-Authenticate", `Basic realm="mitia-ops"`)
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func New(cfg Config) *App {
@@ -93,19 +113,21 @@ func New(cfg Config) *App {
 	mux.HandleFunc("POST /service/{id}/backup", s.backupNow)
 	mux.HandleFunc("GET /service/{id}/backup/{bid}/download", s.downloadBackup)
 	mux.HandleFunc("POST /service/{id}/backup/{bid}/restore", s.restoreBackup)
-	return &App{mux: mux, s: s}
+	handler := basicAuth(mux, cfg.Password)
+	return &App{mux: mux, handler: handler, s: s}
 }
 
 // App is the mitia-ops web application: an http.Handler carrying the routes
 // plus a startup hook that restores previously-running services (see
 // AutoStart).
 type App struct {
-	mux *http.ServeMux
-	s   *server
+	mux     *http.ServeMux
+	handler http.Handler
+	s       *server
 }
 
 func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	a.mux.ServeHTTP(w, r)
+	a.handler.ServeHTTP(w, r)
 }
 
 // AutoStart brings up every service flagged "start on boot", one background

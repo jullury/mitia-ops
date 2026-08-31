@@ -2292,3 +2292,73 @@ func TestDashboardRendersVaultUnsealButton(t *testing.T) {
 		t.Fatalf("dashboard should render an Unseal form for vault: %s", body)
 	}
 }
+
+func TestBasicAuthDisabledWithoutPassword(t *testing.T) {
+	d, h := testServer(t)
+	_ = d
+	req := httptest.NewRequest("GET", "/", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("without a password the app must serve the dashboard, got %d", rec.Code)
+	}
+}
+
+func TestBasicAuth(t *testing.T) {
+	d, err := db.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { d.Close() })
+	c, _ := crypto.New("master")
+	cfg := Config{
+		DB:        d,
+		Cipher:    c,
+		DeployDir: t.TempDir(),
+		Docker:    &fakeRunner{},
+		Password:  "s3cret",
+	}
+	h := New(cfg)
+
+	t.Run("rejects unauthenticated", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/", nil)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("expected 401, got %d", rec.Code)
+		}
+		if got := rec.Header().Get("WWW-Authenticate"); got == "" {
+			t.Fatalf("expected WWW-Authenticate challenge header")
+		}
+	})
+
+	t.Run("rejects wrong password", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/", nil)
+		req.SetBasicAuth("admin", "wrong")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("expected 401, got %d", rec.Code)
+		}
+	})
+
+	t.Run("rejects wrong username", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/", nil)
+		req.SetBasicAuth("someoneelse", "s3cret")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("expected 401, got %d", rec.Code)
+		}
+	})
+
+	t.Run("allows valid credentials", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/", nil)
+		req.SetBasicAuth("admin", "s3cret")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d", rec.Code)
+		}
+	})
+}

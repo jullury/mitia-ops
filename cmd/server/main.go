@@ -236,6 +236,13 @@ func main() {
 		backupSchedule = "off"
 	}
 
+	dashPassword := os.Getenv("MITIAOPS_PASSWORD")
+	if dashPassword == "" {
+		if pf, err := os.ReadFile(os.Getenv("MITIAOPS_PASSWORD_FILE")); err == nil {
+			dashPassword = strings.TrimSpace(string(pf))
+		}
+	}
+
 	addr := os.Getenv("MITIAOPS_ADDR")
 	if addr == "" {
 		addr = ":8080"
@@ -282,6 +289,7 @@ func main() {
 		Cloudflared:    cf,
 		BackupDir:      backupDir,
 		BackupSchedule: backupSchedule,
+		Password:       dashPassword,
 	})
 	// Bring back every service flagged "start on boot" (runs `up` per service in
 	// the background), so an app restart / host reboot restores the stack.

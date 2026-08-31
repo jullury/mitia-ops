@@ -61,6 +61,8 @@ make vet            # go vet
 | `MITIAOPS_DATA`            | `data`                    | SQLite database directory |
 | `MITIAOPS_DEPLOY`          | `deployments`             | Generated compose output (a `.env` is written only temporarily at launch) |
 | `MITIAOPS_ADDR`            | `:8080`                   | Listen address |
+| `MITIAOPS_PASSWORD`        | —                         | Dashboard password (HTTP Basic Auth); when unset the dashboard is unauthenticated |
+| `MITIAOPS_PASSWORD_FILE`   | —                         | Read the dashboard password from a file (e.g. Docker secret) |
 | `MITIAOPS_CLOUDFLARED_HOME`| `<deploy>/cloudflared`    | App-managed cloudflared home (login cert + tunnel credentials) |
 | `MITIAOPS_BACKUPS`         | `<data>/backups`          | Directory for per-service backup snapshots |
 | `MITIAOPS_BACKUP_SCHEDULE` | `off`                     | Global backup cadence: `off` \| `daily` \| `weekly` \| `@hourly` |
@@ -203,8 +205,19 @@ ssh -L 8080:127.0.0.1:8080 user@vps
 # now open http://localhost:8080
 ```
 
-Forward any other service port the same way in the same SSH command, e.g. the
-mailcow HTTP UI (`ssh -L 8080:127.0.0.1:8080 -L 2111:127.0.0.1:2111 user@vps`,
+If you expose the dashboard beyond loopback (e.g. behind a cloudflared tunnel),
+set a dashboard password so anyone who can reach the endpoint is prompted for
+credentials:
+
+```sh
+echo MITIAOPS_PASSWORD=change-me >> /etc/mitia-ops/env
+systemctl restart mitia-ops
+```
+
+Authentication is HTTP Basic Auth (username `admin`, password above); with no
+`MITIAOPS_PASSWORD` / `MITIAOPS_PASSWORD_FILE` set, the dashboard stays
+unauthenticated. Forward any other service port the same way in the same SSH
+command, e.g. the mailcow HTTP UI (`ssh -L 8080:127.0.0.1:8080 -L 2111:127.0.0.1:2111 user@vps`,
 then `http://localhost:2111`). Alternatively keep `:8080` public and put the
 dashboard behind cloudflared, which the app can drive for you (see below).
 
