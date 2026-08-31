@@ -156,6 +156,13 @@ func loadDotEnv(path string) {
 }
 
 func main() {
+	if isUninstall(os.Args[1:]) {
+		if err := uninstall(os.Args[1:]); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+
 	loadDotEnv(".env")
 	masterKey := os.Getenv("MITIAOPS_KEY")
 	if masterKey == "" {
