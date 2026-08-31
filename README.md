@@ -149,6 +149,26 @@ what the next release will look like, open the most recent release PR.
 > **Linux** (amd64 / arm64 / arm) and **macOS** (amd64 / arm64) only.
 > **Windows is not supported** — no Windows binary is built or published.
 
+**Pinned service images.** Every service kind uses a **fixed, immutable image
+tag** (no `:latest`) so each deploy is reproducible and upgrades are deliberate.
+They live in `internal/services/images.go` (plus `CloudflaredImage` in
+`internal/cloudflared`); bump the constant and re-release to upgrade. Current
+versions:
+
+| Service    | Image pin                                                      |
+|------------|----------------------------------------------------------------|
+| cloudflared| `cloudflare/cloudflared:2026.8.2`                              |
+| minio      | `minio/minio:RELEASE.2025-09-07T16-13-09Z`                     |
+| vault      | `hashicorp/vault:2.0.4`                                        |
+| caddy      | `caddy:2.11.4`                                                 |
+| postgres   | `postgres:16-alpine`                                           |
+
+> **⚠️ MinIO is end-of-life.** The MinIO upstream project was archived in
+> **February 2026** and no longer ships releases or security patches; the
+> official Docker Hub image stopped updating. mitia-ops pins the last stable
+> image, but future MinIO CVEs have **no upstream fix**. Treat MinIO as a
+> known risk / legacy service and plan a migration.
+
 **Accessing the dashboard on a headless VPS.** By default the dashboard binds
 `MITIAOPS_ADDR` (default `:8080`) on **all** interfaces. On a public VPS you
 usually want it reachable only from your workstation — bind to loopback and
