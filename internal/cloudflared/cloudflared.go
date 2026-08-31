@@ -248,7 +248,11 @@ func (c *CLI) EnsureTunnel(name string) (string, []byte, error) {
 // plain-text output yields the id with nil credentials.
 func (c *CLI) parseCreated(out string) (string, []byte, error) {
 	var tj tunnelJSON
-	if err := json.Unmarshal([]byte(out), &tj); err == nil {
+	// cloudflared may append a warning log line (e.g. an "outdated version"
+	// notice as a JSON log object) after the tunnel object on stdout. Decoding
+	// just the first JSON value tolerates that trailing noise.
+	tj, err := decodeTunnelJSON(out)
+	if err == nil {
 		id := tj.TunnelID
 		if id == "" {
 			id = tj.ID
@@ -284,6 +288,18 @@ func (c *CLI) parseCreated(out string) (string, []byte, error) {
 		return m[1], nil, nil
 	}
 	return "", nil, fmt.Errorf("cloudflared tunnel create: unexpected output: %q", out)
+}
+
+// decodeTunnelJSON decodes the tunnel JSON object from the create output,
+// reading only the first JSON value so trailing warning/log lines appended by
+// cloudflared are ignored.
+func decodeTunnelJSON(out string) (tunnelJSON, error) {
+	var tj tunnelJSON
+	dec := json.NewDecoder(strings.NewReader(out))
+	if err := dec.Decode(&tj); err != nil {
+		return tunnelJSON{}, err
+	}
+	return tj, nil
 }
 
 // findTunnel looks up an existing tunnel's id by name.
