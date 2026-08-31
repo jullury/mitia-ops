@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -295,16 +296,23 @@ func (c *CLI) parseCreated(out string) (string, []byte, error) {
 	return "", nil, fmt.Errorf("cloudflared tunnel create: unexpected output: %q", out)
 }
 
-// decodeTunnelJSON decodes the tunnel JSON object from the create output,
-// reading only the first JSON value so trailing warning/log lines appended by
-// cloudflared are ignored.
+// decodeTunnelJSON decodes the tunnel JSON object from the create output.
+// cloudflared may interleave warning/log JSON objects (e.g. an "outdated
+// version" notice) with the tunnel object on stdout, in either order, so every
+// JSON value in the stream is scanned and the first one that actually carries a
+// tunnel identifier (id/tunnelID or a credentials token) is returned.
 func decodeTunnelJSON(out string) (tunnelJSON, error) {
-	var tj tunnelJSON
 	dec := json.NewDecoder(strings.NewReader(out))
-	if err := dec.Decode(&tj); err != nil {
-		return tunnelJSON{}, err
+	for dec.More() {
+		var tj tunnelJSON
+		if err := dec.Decode(&tj); err != nil {
+			return tunnelJSON{}, err
+		}
+		if tj.TunnelID != "" || tj.ID != "" || tj.Token != "" {
+			return tj, nil
+		}
 	}
-	return tj, nil
+	return tunnelJSON{}, io.EOF
 }
 
 // findTunnel looks up an existing tunnel's id by name.

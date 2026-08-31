@@ -228,6 +228,32 @@ func TestEnsureTunnelIgnoresTrailingWarningLog(t *testing.T) {
 	}
 }
 
+func TestEnsureTunnelIgnoresLeadingWarningLog(t *testing.T) {
+	token := base64.RawURLEncoding.EncodeToString([]byte(
+		`{"a":"ef2fc5db48cf6d55b98c1fcdd18c62ea","t":"` + testID + `","s":"2Eu1HVe4vqhYnM+Z+umWlZg/6EVQqhqTp/H/dneUXeg="}`,
+	))
+	c := loggedInCLI(t, func(args ...string) (string, error) {
+		return `{"level":"warn","message":"Your version 2026.8.2 is outdated.","time":"2026-08-31T12:25:42Z"}` +
+			`{"id":"` + testID + `","name":"my-tunnel","created_at":"2026-01-01","deleted_at":"0001-01-01T00:00:00Z","connections":[],"token":"` + token + `"}`, nil
+	})
+	id, creds, err := c.EnsureTunnel("my-tunnel")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id != testID {
+		t.Fatalf("id = %q, want %q", id, testID)
+	}
+	for _, field := range []string{
+		`"AccountTag":"ef2fc5db48cf6d55b98c1fcdd18c62ea"`,
+		`"TunnelID":"` + testID + `"`,
+		`"TunnelSecret":"2Eu1HVe4vqhYnM+Z+umWlZg/6EVQqhqTp/H/dneUXeg="`,
+	} {
+		if !strings.Contains(string(creds), field) {
+			t.Fatalf("creds missing %s:\n%s", field, creds)
+		}
+	}
+}
+
 func TestEnsureTunnelRejectsUndecodableToken(t *testing.T) {
 	c := loggedInCLI(t, func(args ...string) (string, error) {
 		return `{"id":"` + testID + `","token":"not-a-token"}`, nil
