@@ -1174,6 +1174,7 @@ var prepareFns = map[services.Kind]func(s *server, id, dir string, values map[st
 	services.KindPostgres:    preparePostgres,
 	services.KindVault:       prepareVault,
 	services.KindGarage:      prepareGarage,
+	services.KindGlitchTip:   prepareGlitchTip,
 }
 
 // prepareGarage materializes the garage.toml the compose mounts and ensures the
@@ -1445,6 +1446,58 @@ func prepareVault(s *server, id, dir string, values map[string]string) error {
 	}
 	content := services.VaultConfig(values)
 	return os.WriteFile(filepath.Join(dir, "vault.hcl"), []byte(content), 0o644)
+}
+
+// prepareGlitchTip resolves GlitchTip's launch-time secrets: the Django
+// SECRET_KEY and the bundled postgres password are generated on first launch
+// and persisted encrypted in the config store (garage pattern), then injected
+// into the launch-time values so the compose ${…} placeholders resolve from the
+// ephemeral .env. Both are stable across launches, so a restore (SQLite config
+// survives) and a deploy-dir recreate keep working against the same data. A
+// blank EMAIL_URL is defaulted to consolemail:// so mail goes to the logs.
+func prepareGlitchTip(s *server, id, dir string, values map[string]string) error {
+	if size := strings.TrimSpace(values["GLITCHTIP_VOLUME_SIZE"]); size != "" {
+		if _, _, msg, ok := s.sizePreflight(dir, id, size); !ok {
+			return errors.New(msg)
+		}
+	}
+	items, err := s.cfg.DB.ConfigItems(id)
+	if err != nil {
+		return err
+	}
+	for _, key := range []string{services.GlitchTipSecretKeyKey, services.GlitchTipDBPasswordKey} {
+		plain := ""
+		if raw := items[key]; raw != "" {
+			if s.cfg.Cipher != nil {
+				if dec, derr := s.cfg.Cipher.Decrypt(raw); derr == nil {
+					plain = dec
+				}
+			}
+			if plain == "" {
+				plain = raw
+			}
+		} else {
+			n := 32
+			if key == services.GlitchTipDBPasswordKey {
+				n = 24
+			}
+			plain = randomHex(n)
+			stored := plain
+			if s.cfg.Cipher != nil {
+				if enc, eerr := s.cfg.Cipher.Encrypt(plain); eerr == nil {
+					stored = enc
+				}
+			}
+			if err := s.cfg.DB.SetConfigItems(id, []db.ConfigItem{{Key: key, Value: stored}}); err != nil {
+				return err
+			}
+		}
+		values[key] = plain
+	}
+	if strings.TrimSpace(values["EMAIL_URL"]) == "" {
+		values["EMAIL_URL"] = "consolemail://"
+	}
+	return nil
 }
 
 // vaultPort resolves the host port Vault is published on, from the decryptable

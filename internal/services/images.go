@@ -12,8 +12,10 @@ package services
 // Cloudflared has its own constant in internal/cloudflared (CloudflaredImage)
 // because both the CLI runner and the compose file reference it.
 const (
-	garageImage   = "dxflrs/garage:v2.3.0"
-	vaultImage    = "hashicorp/vault:2.0.4"
-	caddyImage    = "caddy:2.11.4"
-	postgresImage = "postgres:16-alpine"
+	garageImage    = "dxflrs/garage:v2.3.0"
+	vaultImage     = "hashicorp/vault:2.0.4"
+	caddyImage     = "caddy:2.11.4"
+	postgresImage  = "postgres:16-alpine"
+	glitchTipImage = "glitchtip/glitchtip:6.2.6"
+	valkeyImage    = "valkey/valkey:9.0.6-alpine"
 )

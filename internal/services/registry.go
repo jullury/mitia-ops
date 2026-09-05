@@ -12,6 +12,7 @@ const (
 	KindCloudflared Kind = "cloudflared"
 	KindPostgres    Kind = "postgres"
 	KindVault       Kind = "vault"
+	KindGlitchTip   Kind = "glitchtip"
 )
 
 type Kind string

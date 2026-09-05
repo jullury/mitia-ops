@@ -190,6 +190,8 @@ versions:
 | vault      | `hashicorp/vault:2.0.4`                                        |
 | caddy      | `caddy:2.11.4`                                                 |
 | postgres   | `postgres:16-alpine`                                           |
+| glitchtip  | `glitchtip/glitchtip:6.2.6`                                    |
+| valkey     | `valkey/valkey:9.0.6-alpine` (GlitchTip bundle)                |
 
 **Accessing the dashboard on a headless VPS.** By default the dashboard binds
 `MITIAOPS_ADDR` (default `:8080`) on **all** interfaces. On a public VPS you
@@ -255,6 +257,21 @@ dashboard behind cloudflared, which the app can drive for you (see below).
   Like postgres, a *Volume size limit* guards launch only. Note a deleted
   service's data volume is gone, so unseal keys from the app store no longer
   match — delete, don't reuse.
+- **glitchtip** — Sentry-compatible error tracking (via the official
+  `glitchtip/glitchtip` image). One self-contained stack: the GlitchTip web
+  service (`SERVER_ROLE: all_in_one`) plus an **internal** PostgreSQL (its
+  database) and Valkey (task queue/cache/sessions), so a single added service
+  needs nothing else — no second mitia-ops Postgres to wire up. The Django
+  `SECRET_KEY` and the bundled postgres password are generated on first launch
+  and persisted encrypted in the app's SQLite store, so restores keep working
+  against the same data. Fields: *Domain* (the public URL incl. scheme, e.g.
+  `https://glitchtip.example.com`; defaults to `http://localhost:<port>`), *Host
+  port* (default `8000`), optional *SMTP URL* (blank uses the `consolemail://`
+  backend, so mail goes to the container logs), optional *From email*, and a
+  *Volume size limit* soft guard. Backups capture the `uploads` (sourcemaps)
+  and bundled `pg-data` volumes; Valkey's data is cache-only and not backed up.
+  Set *Domain* to the URL you serve the dashboard from for correct
+  links/redirects.
 - **caddy** — reverse proxy + TLS. **Not fully working yet (WIP).**
 - **mailcow** — mail server. On first **Start** the app clones the official
   [`mailcow/mailcow-dockerized`](https://github.com/mailcow/mailcow-dockerized)

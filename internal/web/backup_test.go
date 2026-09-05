@@ -12,7 +12,28 @@ import (
 
 	"github.com/jullury/mitia-ops/internal/crypto"
 	"github.com/jullury/mitia-ops/internal/db"
+	"github.com/jullury/mitia-ops/internal/services"
 )
+
+// TestBackupVolumesGlitchTip pins the glitchtip snapshot contents: the web
+// service's uploads (sourcemaps) volume and the bundled postgres' pg-data
+// volume. The valkey volume is deliberately excluded — its data is a pure cache
+// and worthless to restore.
+func TestBackupVolumesGlitchTip(t *testing.T) {
+	got, ok := backupVolumes[services.KindGlitchTip]
+	if !ok {
+		t.Fatal("glitchtip missing from backupVolumes")
+	}
+	want := []string{"uploads", "pg-data"}
+	if len(got) != len(want) {
+		t.Fatalf("backup volumes = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("backup volumes = %v, want %v", got, want)
+		}
+	}
+}
 
 // fakeSnapshotRunner records raw calls like fakeRawRunner, but also emulates
 // backup/extract containers' file side effects: when a `run` argv carries a

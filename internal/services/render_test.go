@@ -262,6 +262,75 @@ func TestVaultConfigURL(t *testing.T) {
 	}
 }
 
+func TestGlitchTipRender(t *testing.T) {
+	def, _ := Get(KindGlitchTip)
+	res, err := def.Render(map[string]string{
+		"GLITCHTIP_DOMAIN":      "https://glitchtip.example.com",
+		"GLITCHTIP_PORT":        "9000",
+		"EMAIL_URL":             "smtp://errors:secret@host:25",
+		"DEFAULT_FROM_EMAIL":    "errors@example.com",
+		"GLITCHTIP_VOLUME_SIZE": "10G",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"glitchtip/glitchtip:6.2.6",
+		"valkey/valkey:9.0.6-alpine",
+		"postgres:16-alpine",
+		`- "9000:8000"`,
+		"SERVER_ROLE: all_in_one",
+		"restart: unless-stopped",
+		"GLITCHTIP_DOMAIN: https://glitchtip.example.com",
+		"DEFAULT_FROM_EMAIL: errors@example.com",
+		"EMAIL_URL: ${EMAIL_URL}",
+		"SECRET_KEY: ${GLITCHTIP_SECRET_KEY}",
+		"DATABASE_URL: postgres://postgres:${GLITCHTIP_DB_PASSWORD}@postgres:5432/glitchtip",
+		"POSTGRES_DB: glitchtip",
+		"POSTGRES_PASSWORD: ${GLITCHTIP_DB_PASSWORD}",
+		"VALKEY_URL: redis://valkey:6379",
+		"uploads:/code/uploads",
+		"pg-data",
+	} {
+		if !strings.Contains(res.ComposeYAML, want) {
+			t.Fatalf("compose missing %q:\n%s", want, res.ComposeYAML)
+		}
+	}
+	// The persisted compose must never embed literal secrets — every secret is
+	// a ${…} placeholder resolved from the ephemeral launch-time .env.
+	for _, banned := range []string{"errors:secret", "GLITCHTIP_SECRET_KEY=", "change_me"} {
+		if strings.Contains(res.ComposeYAML, banned) {
+			t.Fatalf("compose must not contain literal secret %q:\n%s", banned, res.ComposeYAML)
+		}
+	}
+}
+
+func TestGlitchTipRenderDefaults(t *testing.T) {
+	def, _ := Get(KindGlitchTip)
+	res, err := def.Render(map[string]string{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`- "8000:8000"`, "GLITCHTIP_DOMAIN: http://localhost:8000"} {
+		if !strings.Contains(res.ComposeYAML, want) {
+			t.Fatalf("default missing %q:\n%s", want, res.ComposeYAML)
+		}
+	}
+}
+
+func TestGlitchTipConfigURL(t *testing.T) {
+	def, _ := Get(KindGlitchTip)
+	if got := def.ConfigURL(map[string]string{"GLITCHTIP_DOMAIN": "https://glitchtip.example.com"}); got != "https://glitchtip.example.com" {
+		t.Fatalf("config url: got %q", got)
+	}
+	if got := def.ConfigURL(map[string]string{"GLITCHTIP_PORT": "9000"}); got != "http://localhost:9000" {
+		t.Fatalf("config url port: got %q", got)
+	}
+	if got := def.ConfigURL(map[string]string{}); got != "http://localhost:8000" {
+		t.Fatalf("config url default: got %q", got)
+	}
+}
+
 func TestListRows(t *testing.T) {
 	columns := []ListColumn{{Suffix: "HOST"}, {Suffix: "SERVICE"}}
 	rows := ListRows(map[string]string{

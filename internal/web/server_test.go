@@ -2362,3 +2362,63 @@ func TestBasicAuth(t *testing.T) {
 		}
 	})
 }
+
+// TestPrepareGlitchTipGeneratesAndPersistsSecrets guards the secret lifecycle:
+// on first launch the Django SECRET_KEY and the bundled postgres password are
+// generated, injected into the launch-time values (so the ephemeral .env
+// resolves the compose ${…} placeholders), and persisted ENCRYPTED in config —
+// never plaintext — and reused verbatim on every later launch so a restore and
+// a recreate keep working against the same data.
+func TestPrepareGlitchTipGeneratesAndPersistsSecrets(t *testing.T) {
+	d, err := db.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { d.Close() })
+	c, _ := crypto.New("master")
+	s := &server{cfg: Config{DB: d, Cipher: c, DeployDir: t.TempDir()}}
+	id, _ := d.CreateService("glitchtip", "errors")
+	dir := filepath.Join(t.TempDir(), id)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	values := map[string]string{"GLITCHTIP_PORT": "8000"}
+	if err := prepareGlitchTip(s, id, dir, values); err != nil {
+		t.Fatal(err)
+	}
+	if len(values["GLITCHTIP_SECRET_KEY"]) < 32 {
+		t.Fatalf("secret key too short: %q", values["GLITCHTIP_SECRET_KEY"])
+	}
+	if len(values["GLITCHTIP_DB_PASSWORD"]) < 20 {
+		t.Fatalf("db password too short: %q", values["GLITCHTIP_DB_PASSWORD"])
+	}
+	if values["EMAIL_URL"] != "consolemail://" {
+		t.Fatalf("blank EMAIL_URL must default to consolemail://, got %q", values["EMAIL_URL"])
+	}
+
+	items, _ := d.ConfigItems(id)
+	for _, k := range []string{"GLITCHTIP_SECRET_KEY", "GLITCHTIP_DB_PASSWORD"} {
+		if items[k] == "" {
+			t.Fatalf("%s not persisted", k)
+		}
+		if items[k] == values[k] {
+			t.Fatalf("%s must be stored encrypted, found plaintext", k)
+		}
+		if dec, derr := c.Decrypt(items[k]); derr != nil || dec != values[k] {
+			t.Fatalf("%s encrypt/decrypt mismatch: %v", k, derr)
+		}
+	}
+
+	// Second launch reuses the stored secrets verbatim.
+	again := map[string]string{}
+	if err := prepareGlitchTip(s, id, dir, again); err != nil {
+		t.Fatal(err)
+	}
+	if again["GLITCHTIP_SECRET_KEY"] != values["GLITCHTIP_SECRET_KEY"] {
+		t.Fatal("SECRET_KEY must be stable across launches")
+	}
+	if again["GLITCHTIP_DB_PASSWORD"] != values["GLITCHTIP_DB_PASSWORD"] {
+		t.Fatal("DB password must be stable across launches")
+	}
+}

@@ -11,7 +11,7 @@ func TestRegistryContainsServices(t *testing.T) {
 	for _, d := range defs {
 		byKind[d.Kind] = d
 	}
-	for _, k := range []Kind{KindGarage, KindMailcow, KindCaddy, KindCloudflared, KindPostgres, KindVault} {
+	for _, k := range []Kind{KindGarage, KindMailcow, KindCaddy, KindCloudflared, KindPostgres, KindVault, KindGlitchTip} {
 		if _, ok := byKind[k]; !ok {
 			t.Fatalf("missing definition for %s", k)
 		}
@@ -170,6 +170,44 @@ func TestPostgresDefinition(t *testing.T) {
 	}
 	if size == nil || size.Type != FieldSize || len(size.Units) == 0 {
 		t.Fatalf("postgres must declare a FieldSize volume (initiation guard), got %+v", size)
+	}
+}
+
+func TestGlitchTipDefinition(t *testing.T) {
+	def, ok := Get(KindGlitchTip)
+	if !ok {
+		t.Fatal("glitchtip definition missing")
+	}
+	if def.ReadOnly {
+		t.Fatal("glitchtip must be lifecycle-controlled")
+	}
+	if def.ConfigURL == nil {
+		t.Fatal("glitchtip must provide a ConfigURL func")
+	}
+	keys := map[string]bool{}
+	var size *Field
+	for i := range def.Fields {
+		f := &def.Fields[i]
+		keys[f.Key] = true
+		if f.Key == "EMAIL_URL" && f.Type != FieldSecret {
+			t.Fatalf("EMAIL_URL must be a secret field, got %+v", f)
+		}
+		if f.Key == "GLITCHTIP_VOLUME_SIZE" {
+			size = f
+		}
+	}
+	for _, want := range []string{"GLITCHTIP_DOMAIN", "GLITCHTIP_PORT", "EMAIL_URL", "DEFAULT_FROM_EMAIL", "GLITCHTIP_VOLUME_SIZE"} {
+		if !keys[want] {
+			t.Fatalf("glitchtip missing field %s (have %v)", want, keys)
+		}
+	}
+	// The Django SECRET_KEY and the bundled postgres password are
+	// auto-generated at launch (garage pattern), never operator-entered.
+	if keys["GLITCHTIP_SECRET_KEY"] || keys["GLITCHTIP_DB_PASSWORD"] {
+		t.Fatalf("glitchtip must not expose credential form fields: %v", keys)
+	}
+	if size == nil || size.Type != FieldSize || len(size.Units) == 0 {
+		t.Fatalf("glitchtip must declare a FieldSize volume (initiation guard), got %+v", size)
 	}
 }
 

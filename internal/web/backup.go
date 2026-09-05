@@ -39,10 +39,11 @@ func backupFilename(kind string, t time.Time) string {
 // resolved per deploy dir (project-scoped) or, for garage, the tracked external
 // name. nil/empty means "deploy dir only".
 var backupVolumes = map[services.Kind][]string{
-	services.KindGarage:   {"garage_data"},
-	services.KindPostgres: {"pg_data"},
-	services.KindVault:    {"vault_data"},
-	services.KindCaddy:    {"caddy_data", "caddy_config"},
+	services.KindGarage:    {"garage_data"},
+	services.KindPostgres:  {"pg_data"},
+	services.KindVault:     {"vault_data"},
+	services.KindCaddy:     {"caddy_data", "caddy_config"},
+	services.KindGlitchTip: {"uploads", "pg-data"},
 }
 
 func parseSchedule(s string) (Schedule, error) {
