@@ -122,17 +122,28 @@ func update(args []string) error {
 	}
 	old := currentVersion()
 
-	tmp := filepath.Join(os.TempDir(), "mitia-ops-update-"+asset)
-	defer os.Remove(tmp)
-
-	fmt.Printf("downloading %s\n", url)
-	if err := fetchFunc(url, tmp); err != nil {
-		return fmt.Errorf("download %s: %w", url, err)
-	}
-	if err := os.Chmod(tmp, 0o755); err != nil {
+	// Stage the download in a temp file NEXT TO the target and rename within
+	// that same directory. Renaming across mounts (e.g. the tmpfs /tmp to the
+	// on-disk /usr/local/bin) fails with "invalid cross-device link"; staging
+	// here keeps the rename on one filesystem.
+	tmp, err := os.CreateTemp(filepath.Dir(updateBinPath), ".mitia-ops-update-*")
+	if err != nil {
 		return err
 	}
-	if err := os.Rename(tmp, updateBinPath); err != nil {
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+
+	fmt.Printf("downloading %s\n", url)
+	if err := fetchFunc(url, tmpPath); err != nil {
+		return fmt.Errorf("download %s: %w", url, err)
+	}
+	if err := os.Chmod(tmpPath, 0o755); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, updateBinPath); err != nil {
 		return err
 	}
 	// The daemon is still running the previous, now-unlinked inode until we
