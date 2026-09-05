@@ -1,6 +1,13 @@
 # Changelog
 
 
+## [1.7.0](https://github.com/jullury/mitia-ops/compare/v1.6.0...v1.7.0) (2026-09-05)
+
+
+### Features
+
+* **glitchtip:** add GlitchTip error tracking service ([36ce4bf](https://github.com/jullury/mitia-ops/commit/36ce4bfc62eb749c94f703c27b035d7b1692c40f))
+
 ## [1.6.0](https://github.com/jullury/mitia-ops/compare/v1.5.0...v1.6.0) (2026-08-31)
 
 
