@@ -1,6 +1,13 @@
 # Changelog
 
 
+## [1.7.1](https://github.com/jullury/mitia-ops/compare/v1.7.0...v1.7.1) (2026-09-05)
+
+
+### Bug Fixes
+
+* **update:** stage binary beside target to avoid cross-device rename ([d3d1361](https://github.com/jullury/mitia-ops/commit/d3d136111182980b98e124435266f978d575b378))
+
 ## [1.7.0](https://github.com/jullury/mitia-ops/compare/v1.6.0...v1.7.0) (2026-09-05)
 
 
